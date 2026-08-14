@@ -7,11 +7,14 @@ import (
 
 	"github.com/spf13/pflag"
 
+	"k8s-watson/internal/chat"
 	"k8s-watson/internal/config"
 	"k8s-watson/internal/diagnostics"
+	"k8s-watson/internal/models/ollama"
+	"k8s-watson/internal/tui"
 )
 
-func runApplication(values config.Values, flags *pflag.FlagSet, runTUI func(config.Config) error) (returnErr error) {
+func runApplication(values config.Values, flags *pflag.FlagSet, runTUI func(tui.Client) error) (returnErr error) {
 	values = valuesFromFlags(values, flags)
 
 	loadedConfig, err := config.Load(values, os.LookupEnv, time.Now())
@@ -31,7 +34,16 @@ func runApplication(values config.Values, flags *pflag.FlagSet, runTUI func(conf
 		}
 	}()
 
-	return runTUI(loadedConfig)
+	model, err := ollama.New(loadedConfig.OllamaURL, loadedConfig.Model, loadedConfig.OllamaTimeout, logger)
+	if err != nil {
+		return fmt.Errorf("initialize Ollama client: %w", err)
+	}
+	chatService, err := chat.New(model)
+	if err != nil {
+		return fmt.Errorf("initialize chat service: %w", err)
+	}
+
+	return runTUI(chatService)
 }
 
 func valuesFromFlags(values config.Values, flags *pflag.FlagSet) config.Values {

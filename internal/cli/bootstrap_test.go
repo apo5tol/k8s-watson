@@ -9,6 +9,7 @@ import (
 	"github.com/spf13/pflag"
 
 	"k8s-watson/internal/config"
+	"k8s-watson/internal/tui"
 )
 
 func TestValuesFromFlags(t *testing.T) {
@@ -52,7 +53,7 @@ func TestRunApplicationWrapsDiagnosticsInitializationError(t *testing.T) {
 	values.DebugLog = filepath.Join(t.TempDir(), "missing", "diagnostics.log")
 	values.DebugLogSet = true
 
-	err := runApplication(values, changedFlags(t, values.Model, values.DebugLog), func(config.Config) error { return nil })
+	err := runApplication(values, changedFlags(t, values.Model, values.DebugLog), func(tui.Client) error { return nil })
 	if err == nil || !strings.Contains(err.Error(), "initialize diagnostics") {
 		t.Errorf("runApplication() error = %v, want diagnostics initialization error", err)
 	}
@@ -63,7 +64,7 @@ func TestRunApplicationLogsLifecycle(t *testing.T) {
 	values.DebugLog = filepath.Join(t.TempDir(), "diagnostics.log")
 	values.DebugLogSet = true
 
-	if err := runApplication(values, changedFlags(t, values.Model, values.DebugLog), func(config.Config) error { return nil }); err != nil {
+	if err := runApplication(values, changedFlags(t, values.Model, values.DebugLog), func(tui.Client) error { return nil }); err != nil {
 		t.Fatalf("runApplication() error = %v", err)
 	}
 	contents, err := os.ReadFile(values.DebugLog)

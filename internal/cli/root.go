@@ -20,7 +20,7 @@ func Execute(args []string, stdout, stderr io.Writer) int {
 	return execute(args, stdout, stderr, tui.Run)
 }
 
-func execute(args []string, stdout, stderr io.Writer, runTUI func(config.Config) error) int {
+func execute(args []string, stdout, stderr io.Writer, runTUI func(tui.Client) error) int {
 	command := newRootCommand(stdout, stderr, runTUI)
 	command.SetArgs(args)
 
@@ -44,7 +44,7 @@ func NewRootCommand(stdout, stderr io.Writer) *cobra.Command {
 	return newRootCommand(stdout, stderr, tui.Run)
 }
 
-func newRootCommand(stdout, stderr io.Writer, runTUI func(config.Config) error) *cobra.Command {
+func newRootCommand(stdout, stderr io.Writer, runTUI func(tui.Client) error) *cobra.Command {
 	var showVersion bool
 	var values config.Values
 
