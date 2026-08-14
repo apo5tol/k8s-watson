@@ -1,0 +1,60 @@
+version: "2"
+
+linters:
+  default: none
+  enable:
+    - asasalint
+    - asciicheck
+    - bodyclose
+    - containedctx
+    - cyclop
+    - dupl
+    - errcheck
+    - errchkjson
+    - errorlint
+    - funlen
+    - gocognit
+    - gocritic
+    - gosec
+    - gosmopolitan
+    - govet
+    - ineffassign
+    - maintidx
+    - misspell
+    - nakedret
+    - nestif
+    - nilerr
+    - perfsprint
+    - staticcheck
+    - unconvert
+    - unparam
+    - unused
+    - usestdlibvars
+  settings:
+    cyclop:
+      max-complexity: 12
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+
+issues:
+  max-same-issues: 0
+
+formatters:
+  enable:
+    - gci
+    - gofmt
+    - goimports
+  settings:
+    gci:
+      sections:
+        - standard
+        - default
+        - prefix(k8s-watson/)
+      custom-order: true
+  exclusions:
+    generated: lax
