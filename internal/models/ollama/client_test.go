@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -103,6 +104,40 @@ func TestClientChatCancellationStopsRetry(t *testing.T) {
 	}
 }
 
+func TestClientChatCancellationInterruptsRequest(t *testing.T) {
+	requestStarted := make(chan struct{})
+	releaseRequest := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+		close(requestStarted)
+		<-releaseRequest
+	}))
+	defer func() {
+		close(releaseRequest)
+		server.Close()
+	}()
+
+	client := newTestClient(t, server.URL, time.Second)
+	client.sleep = func(context.Context, time.Duration) error {
+		t.Fatal("retry delay called after cancellation")
+		return nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	errs := make(chan error, 1)
+	go func() {
+		_, err := client.Chat(ctx, "show pods")
+		errs <- err
+	}()
+	<-requestStarted
+	cancel()
+
+	select {
+	case err := <-errs:
+		assertErrorKind(t, err, ErrorCanceled)
+	case <-time.After(time.Second):
+		t.Fatal("canceled request did not stop")
+	}
+}
+
 func TestClientChatRejectsInvalidResponses(t *testing.T) {
 	tests := []struct {
 		name string
@@ -128,6 +163,17 @@ func TestClientChatRejectsInvalidResponses(t *testing.T) {
 	}
 }
 
+func TestClientChatRejectsOversizedResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(strings.Repeat("x", maximumResponseBodySize+1)))
+	}))
+	defer server.Close()
+
+	client := newTestClient(t, server.URL, time.Second)
+	_, err := client.Chat(context.Background(), "show pods")
+	assertErrorKind(t, err, ErrorInvalidResponse)
+}
+
 func TestClientChatDoesNotRetryRequestErrors(t *testing.T) {
 	var calls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -141,6 +187,25 @@ func TestClientChatDoesNotRetryRequestErrors(t *testing.T) {
 		t.Fatal("retry delay called for request error")
 		return nil
 	}
+	_, err := client.Chat(context.Background(), "show pods")
+	assertErrorKind(t, err, ErrorRequest)
+	if got := calls.Load(); got != 1 {
+		t.Errorf("requests = %d, want 1", got)
+	}
+}
+
+func TestClientChatDoesNotRetryPermanentTransportErrors(t *testing.T) {
+	client := newTestClient(t, "http://ollama.example", time.Second)
+	var calls atomic.Int32
+	client.http.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) {
+		calls.Add(1)
+		return nil, errors.New("invalid server certificate")
+	})
+	client.sleep = func(context.Context, time.Duration) error {
+		t.Fatal("retry delay called for permanent transport error")
+		return nil
+	}
+
 	_, err := client.Chat(context.Background(), "show pods")
 	assertErrorKind(t, err, ErrorRequest)
 	if got := calls.Load(); got != 1 {
@@ -202,4 +267,10 @@ func assertErrorKind(t *testing.T, err error, want ErrorKind) {
 	if ollamaErr.Kind != want {
 		t.Errorf("error kind = %q, want %q", ollamaErr.Kind, want)
 	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
 }

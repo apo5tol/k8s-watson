@@ -16,8 +16,9 @@ import (
 )
 
 const (
-	maxAttempts = 3
-	retryDelay  = time.Second
+	maxAttempts             = 3
+	retryDelay              = time.Second
+	maximumResponseBodySize = 1 << 20
 )
 
 type ErrorKind string
@@ -132,8 +133,16 @@ func (c *Client) chatOnce(ctx context.Context, prompt string) (string, error) {
 		return "", classifyHTTPError(resp)
 	}
 
+	body, isTruncated, err := readResponseBody(resp.Body)
+	if err != nil {
+		return "", &Error{Kind: ErrorInvalidResponse, Err: fmt.Errorf("read chat response: %w", err)}
+	}
+	if isTruncated {
+		return "", &Error{Kind: ErrorInvalidResponse, Err: errors.New("chat response exceeds size limit")}
+	}
+
 	var response chatResponse
-	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+	if err := json.Unmarshal(body, &response); err != nil {
 		return "", &Error{Kind: ErrorInvalidResponse, Err: fmt.Errorf("decode chat response: %w", err)}
 	}
 	if !response.Done {
@@ -170,11 +179,11 @@ func classifyTransportError(parentCtx, attemptCtx context.Context, err error) er
 	if errors.As(err, &networkError) && networkError.Timeout() {
 		return &Error{Kind: ErrorTimeout, Err: err}
 	}
-	return &Error{Kind: ErrorTemporary, Err: err}
+	return &Error{Kind: ErrorRequest, Err: err}
 }
 
 func classifyHTTPError(resp *http.Response) error {
-	body, err := io.ReadAll(resp.Body)
+	body, isTruncated, err := readResponseBody(resp.Body)
 	if err != nil {
 		return &Error{Kind: ErrorRequest, Err: fmt.Errorf("read error response: %w", err)}
 	}
@@ -189,12 +198,28 @@ func classifyHTTPError(resp *http.Response) error {
 	if message == "" {
 		message = resp.Status
 	}
+	if isTruncated {
+		message += "\n[response truncated]"
+	}
 
 	kind := ErrorRequest
 	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= http.StatusInternalServerError {
 		kind = ErrorTemporary
 	}
 	return &Error{Kind: kind, Err: fmt.Errorf("HTTP %d: %s", resp.StatusCode, message)}
+}
+
+func readResponseBody(body io.Reader) ([]byte, bool, error) {
+	limitedBody := io.LimitReader(body, maximumResponseBodySize+1)
+	contents, err := io.ReadAll(limitedBody)
+	if err != nil {
+		return nil, false, err
+	}
+	if len(contents) > maximumResponseBodySize {
+		return contents[:maximumResponseBodySize], true, nil
+	}
+
+	return contents, false, nil
 }
 
 func canceledError(err error) error {
