@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"time"
@@ -10,32 +11,28 @@ import (
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
-
-	"k8s-watson/internal/config"
 )
 
 const (
-	defaultWidth            = 80
-	defaultHeight           = 24
-	minimumInputHeight      = 1
-	maximumInputHeight      = 3
-	panelHorizontalMargin   = 2
-	panelContentWidthOffset = 4
-	viewportHeightOffset    = 5
-	minimumComponentSize    = 1
-	panelVerticalPadding    = 0
-	panelHorizontalPadding  = 1
-	colorBackground         = "#2B2B2B"
-	colorPanelBackground    = "#313335"
-	colorPanelBorder        = "#515151"
-	colorText               = "#A9B7C6"
-	colorMutedText          = "#808080"
-	colorAccent             = "#9876AA"
-	colorLogo               = "#6897BB"
-	colorUser               = "#6A8759"
-	colorCursor             = "#CC7832"
-	responseDelay           = 150 * time.Millisecond
-	logo                    = ``
+	defaultWidth           = 80
+	defaultHeight          = 24
+	minimumInputHeight     = 1
+	maximumInputHeight     = 3
+	panelHorizontalMargin  = 2
+	minimumComponentSize   = 1
+	panelVerticalPadding   = 0
+	panelHorizontalPadding = 1
+	colorBackground        = "#2B2B2B"
+	colorPanelBackground   = "#313335"
+	colorPanelBorder       = "#515151"
+	colorText              = "#A9B7C6"
+	colorMutedText         = "#808080"
+	colorAccent            = "#9876AA"
+	colorLogo              = "#6897BB"
+	colorUser              = "#6A8759"
+	colorCursor            = "#CC7832"
+	responseDelay          = 150 * time.Millisecond
+	logo                   = ``
 )
 
 var (
@@ -61,31 +58,41 @@ const (
 
 type responseMsg struct {
 	id       int
-	question string
+	response string
+	err      error
+}
+
+type Client interface {
+	Ask(context.Context, string) (string, error)
 }
 
 type model struct {
-	history  []message
-	input    textarea.Model
-	viewport viewport.Model
-	spinner  spinner.Model
-	width    int
-	height   int
-	state    turnState
-	turnID   int
+	history       []message
+	client        Client
+	cancelRequest context.CancelFunc
+	input         textarea.Model
+	viewport      viewport.Model
+	spinner       spinner.Model
+	width         int
+	height        int
+	state         turnState
+	turnID        int
 }
 
-// Run starts the standalone TUI skeleton. Configuration is accepted at this
-// boundary so future chat dependencies can be assembled by the CLI.
-func Run(_ config.Config) error {
-	if _, err := tea.NewProgram(newModel()).Run(); err != nil {
+func Run(client Client) error {
+	if _, err := tea.NewProgram(newModel(client)).Run(); err != nil {
 		return fmt.Errorf("run TUI: %w", err)
 	}
 
 	return nil
 }
 
-func newModel() model {
+func newModel(clients ...Client) model {
+	var client Client
+	if len(clients) > 0 {
+		client = clients[0]
+	}
+
 	input := textarea.New()
 	input.Placeholder = "Ask a question about Kubernetes…"
 	input.Focus()
@@ -99,10 +106,11 @@ func newModel() model {
 
 	m := model{
 		history: []message{{content: logo}},
+		client:  client,
 		input:   input,
 		viewport: viewport.New(
-			viewport.WithWidth(defaultWidth-panelContentWidthOffset),
-			viewport.WithHeight(defaultHeight-viewportHeightOffset),
+			viewport.WithWidth(panelContentWidth(defaultWidth)),
+			viewport.WithHeight(minimumComponentSize),
 		),
 		spinner: spinnerModel,
 		width:   defaultWidth,
@@ -130,7 +138,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.id != m.turnID || m.state != stateProcessing {
 			return m, nil
 		}
-		m.appendHistory(message{author: "Watson", content: "Echo: " + msg.question})
+		m.cancelRequest = nil
+		if msg.err != nil {
+			m.appendHistory(message{author: "Watson", content: "Request failed: " + msg.err.Error()})
+		} else {
+			m.appendHistory(message{author: "Watson", content: msg.response})
+		}
 		m.state = stateReady
 		return m, nil
 	case spinner.TickMsg:
@@ -163,6 +176,7 @@ func (m model) View() tea.View {
 	view.BackgroundColor = lipgloss.Color(colorBackground)
 	view.ForegroundColor = lipgloss.Color(colorText)
 	view.KeyboardEnhancements.ReportAllKeysAsEscapeCodes = true
+	view.MouseMode = tea.MouseModeCellMotion
 
 	return view
 }
@@ -223,9 +237,7 @@ func (m model) submit() (tea.Model, tea.Cmd) {
 	m.viewport.GotoBottom()
 	turnID := m.turnID
 
-	return m, tea.Tick(responseDelay, func(time.Time) tea.Msg {
-		return responseMsg{id: turnID, question: question}
-	})
+	return m, m.request(turnID, question)
 }
 
 func (m model) runCommand(command string) (tea.Model, tea.Cmd) {
@@ -248,6 +260,10 @@ func (m model) runCommand(command string) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) cancel() {
+	if m.cancelRequest != nil {
+		m.cancelRequest()
+		m.cancelRequest = nil
+	}
 	m.turnID++
 	m.state = stateReady
 	m.appendHistory(message{author: "Watson", content: "Request cancelled."})
@@ -275,15 +291,39 @@ func (m *model) refreshHistory() {
 		}
 		entries = append(entries, author+"\n"+entry.content)
 	}
-	m.viewport.SetContent(strings.Join(entries, "\n\n"))
+	m.viewport.SetContent(lipgloss.Wrap(strings.Join(entries, "\n\n"), m.viewport.Width(), ""))
 }
 
 func (m *model) resize() {
-	panelWidth := max(m.width-panelContentWidthOffset, minimumComponentSize)
+	panelWidth := panelContentWidth(m.width)
 	m.input.SetHeight(inputHeight(m.input.Value()))
 	m.viewport.SetWidth(panelWidth)
-	m.viewport.SetHeight(max(m.height-viewportHeightOffset-m.input.Height(), minimumComponentSize))
+	m.viewport.SetHeight(max(m.height-statusHeight()-panelStyle.GetVerticalFrameSize()*2-m.input.Height(), minimumComponentSize))
 	m.input.SetWidth(panelWidth)
+	m.refreshHistory()
+}
+
+func panelContentWidth(width int) int {
+	return max(width-panelHorizontalMargin-panelStyle.GetHorizontalFrameSize(), minimumComponentSize)
+}
+
+func (m *model) request(turnID int, question string) tea.Cmd {
+	if m.client == nil {
+		return tea.Tick(responseDelay, func(time.Time) tea.Msg {
+			return responseMsg{id: turnID, response: "Echo: " + question}
+		})
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	m.cancelRequest = cancel
+	return func() tea.Msg {
+		response, err := m.client.Ask(ctx, question)
+		return responseMsg{id: turnID, response: response, err: err}
+	}
+}
+
+func statusHeight() int {
+	return 1
 }
 
 func inputHeight(value string) int {

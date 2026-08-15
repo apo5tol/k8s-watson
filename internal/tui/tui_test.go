@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 )
 
 func TestViewUsesFullScreenAndFillsViewport(t *testing.T) {
@@ -16,6 +17,9 @@ func TestViewUsesFullScreenAndFillsViewport(t *testing.T) {
 	}
 	if !m.viewport.FillHeight {
 		t.Error("viewport.FillHeight = false, want true")
+	}
+	if view.MouseMode != tea.MouseModeCellMotion {
+		t.Errorf("View().MouseMode = %v, want %v", view.MouseMode, tea.MouseModeCellMotion)
 	}
 }
 
@@ -124,12 +128,12 @@ func TestResponseCompletesOnlyCurrentRequest(t *testing.T) {
 	m.state = stateProcessing
 	m.turnID = 3
 
-	stale := updateModel(t, m, responseMsg{id: 2, question: "old"})
+	stale := updateModel(t, m, responseMsg{id: 2, response: "old"})
 	if stale.state != stateProcessing || len(stale.history) != 1 {
 		t.Errorf("stale response state = %q, history = %#v; want unchanged processing request", stale.state, stale.history)
 	}
 
-	got := updateModel(t, stale, responseMsg{id: 3, question: "pods"})
+	got := updateModel(t, stale, responseMsg{id: 3, response: "Echo: pods"})
 	if got.state != stateReady || got.history[len(got.history)-1] != (message{author: "Watson", content: "Echo: pods"}) {
 		t.Errorf("current response state = %q, history = %#v; want echoed response in ready state", got.state, got.history)
 	}
@@ -196,8 +200,8 @@ func TestResizeUpdatesComponentDimensions(t *testing.T) {
 	if got.width != 100 || got.height != 30 {
 		t.Errorf("model size = %dx%d, want 100x30", got.width, got.height)
 	}
-	if got.input.Width() != 94 || got.input.Height() != 3 || got.viewport.Width() != 96 || got.viewport.Height() != 22 {
-		t.Errorf("component sizes input = %dx%d, viewport = %dx%d; want input 94x3 and viewport 96x22", got.input.Width(), got.input.Height(), got.viewport.Width(), got.viewport.Height())
+	if got.input.Width() != 92 || got.input.Height() != 3 || got.viewport.Width() != 94 || got.viewport.Height() != 22 {
+		t.Errorf("component sizes input = %dx%d, viewport = %dx%d; want input 92x3 and viewport 94x22", got.input.Width(), got.input.Height(), got.viewport.Width(), got.viewport.Height())
 	}
 
 	got = updateModel(t, got, tea.WindowSizeMsg{Width: 1, Height: 1})
@@ -215,6 +219,52 @@ func TestViewShowsCurrentStatus(t *testing.T) {
 	m.state = stateProcessing
 	if view := m.View().Content; !strings.Contains(view, "Status: processing") {
 		t.Errorf("processing view = %q, want processing status", view)
+	}
+}
+
+func TestLongResponseStaysWithinWindowAndHistoryCanScroll(t *testing.T) {
+	m := updateModel(t, newModel(), tea.WindowSizeMsg{Width: 100, Height: 30})
+	m.state = stateProcessing
+	m.turnID = 1
+
+	got := updateModel(t, m, responseMsg{id: 1, response: strings.Repeat("a long response ", 200)})
+	if height := lipgloss.Height(got.View().Content); height != 30 {
+		t.Errorf("view height = %d, want 30", height)
+	}
+	if got.viewport.TotalLineCount() <= got.viewport.Height() {
+		t.Fatalf("history lines = %d, want more than viewport height %d", got.viewport.TotalLineCount(), got.viewport.Height())
+	}
+
+	got = updateModel(t, got, tea.KeyPressMsg{Code: tea.KeyPgUp})
+	if got.viewport.AtBottom() {
+		t.Error("viewport remains at bottom after PageUp")
+	}
+
+	got.viewport.GotoBottom()
+	got = updateModel(t, got, tea.MouseWheelMsg{Button: tea.MouseWheelUp})
+	if got.viewport.AtBottom() {
+		t.Error("viewport remains at bottom after mouse wheel up")
+	}
+}
+
+func TestLongResponseRemainsScrollableAfterResize(t *testing.T) {
+	m := updateModel(t, newModel(), tea.WindowSizeMsg{Width: 100, Height: 30})
+	m.state = stateProcessing
+	m.turnID = 1
+
+	got := updateModel(t, m, responseMsg{id: 1, response: strings.Repeat("a long response ", 200)})
+	got = updateModel(t, got, tea.WindowSizeMsg{Width: 60, Height: 20})
+	if height := lipgloss.Height(got.View().Content); height != 20 {
+		t.Errorf("view height after resize = %d, want 20", height)
+	}
+	if got.viewport.TotalLineCount() <= got.viewport.Height() {
+		t.Fatalf("history lines after resize = %d, want more than viewport height %d", got.viewport.TotalLineCount(), got.viewport.Height())
+	}
+
+	got.viewport.GotoBottom()
+	got = updateModel(t, got, tea.MouseWheelMsg{Button: tea.MouseWheelUp})
+	if got.viewport.AtBottom() {
+		t.Error("viewport remains at bottom after resize and mouse wheel up")
 	}
 }
 
