@@ -11,10 +11,9 @@ import (
 	"k8s-watson/internal/config"
 	"k8s-watson/internal/diagnostics"
 	"k8s-watson/internal/models/ollama"
-	"k8s-watson/internal/tui"
 )
 
-func runApplication(values config.Values, flags *pflag.FlagSet, runTUI func(tui.Client) error) (returnErr error) {
+func runApplication(values config.Values, flags *pflag.FlagSet, runTUI tuiRunner) (returnErr error) {
 	values = valuesFromFlags(values, flags)
 
 	loadedConfig, err := config.Load(values, os.LookupEnv, time.Now())
@@ -43,7 +42,7 @@ func runApplication(values config.Values, flags *pflag.FlagSet, runTUI func(tui.
 		return fmt.Errorf("initialize chat service: %w", err)
 	}
 
-	return runTUI(chatService)
+	return runTUI(chatService, loadedConfig.MaxHistoryChars)
 }
 
 func valuesFromFlags(values config.Values, flags *pflag.FlagSet) config.Values {

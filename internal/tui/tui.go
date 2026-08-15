@@ -2,9 +2,13 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
+	"os/signal"
 	"strings"
-	"time"
+	"syscall"
+	"unicode/utf8"
 
 	"charm.land/bubbles/v2/spinner"
 	"charm.land/bubbles/v2/textarea"
@@ -31,7 +35,6 @@ const (
 	colorLogo              = "#6897BB"
 	colorUser              = "#6A8759"
 	colorCursor            = "#CC7832"
-	responseDelay          = 150 * time.Millisecond
 	logo                   = ``
 )
 
@@ -63,6 +66,7 @@ type responseMsg struct {
 }
 
 type quitMsg struct{}
+type shutdownMsg struct{}
 
 type Client interface {
 	Ask(context.Context, string) (string, error)
@@ -80,22 +84,43 @@ type model struct {
 	height        int
 	state         turnState
 	turnID        int
+	historyLimit  int
 }
 
-func Run(client Client) error {
-	if _, err := tea.NewProgram(newModel(client)).Run(); err != nil {
+func Run(client Client, maxHistoryChars int) error {
+	if client == nil {
+		return errors.New("TUI client is required")
+	}
+	if maxHistoryChars <= 0 {
+		return errors.New("TUI history limit must be positive")
+	}
+
+	program := tea.NewProgram(
+		newModel(client, maxHistoryChars),
+		tea.WithoutSignalHandler(),
+	)
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(signals)
+
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-signals:
+			program.Send(shutdownMsg{})
+		case <-done:
+		}
+	}()
+
+	if _, err := program.Run(); err != nil {
 		return fmt.Errorf("run TUI: %w", err)
 	}
 
 	return nil
 }
 
-func newModel(clients ...Client) model {
-	var client Client
-	if len(clients) > 0 {
-		client = clients[0]
-	}
-
+func newModel(client Client, maxHistoryChars int) model {
 	input := textarea.New()
 	input.Placeholder = "Ask a question about Kubernetes…"
 	input.Focus()
@@ -115,10 +140,11 @@ func newModel(clients ...Client) model {
 			viewport.WithWidth(panelContentWidth(defaultWidth)),
 			viewport.WithHeight(minimumComponentSize),
 		),
-		spinner: spinnerModel,
-		width:   defaultWidth,
-		height:  defaultHeight,
-		state:   stateReady,
+		spinner:      spinnerModel,
+		width:        defaultWidth,
+		height:       defaultHeight,
+		state:        stateReady,
+		historyLimit: maxHistoryChars,
 	}
 	m.viewport.FillHeight = true
 	m.refreshHistory()
@@ -128,7 +154,7 @@ func newModel(clients ...Client) model {
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(textarea.Blink, m.spinner.Tick)
+	return textarea.Blink
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -139,6 +165,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.resize()
 	case quitMsg:
 		return m, tea.Quit
+	case shutdownMsg:
+		return m, m.quit()
 	case responseMsg:
 		if msg.id != m.turnID || m.state != stateProcessing {
 			return m, nil
@@ -234,6 +262,7 @@ func (m model) submit() (tea.Model, tea.Cmd) {
 	}
 
 	m.history = append(m.history, message{author: "You", content: question})
+	m.trimHistory()
 	m.input.Reset()
 	m.resize()
 	m.state = stateProcessing
@@ -242,7 +271,7 @@ func (m model) submit() (tea.Model, tea.Cmd) {
 	m.viewport.GotoBottom()
 	turnID := m.turnID
 
-	return m, m.request(turnID, question)
+	return m, tea.Batch(m.spinner.Tick, m.request(turnID, question))
 }
 
 func (m model) runCommand(command string) (tea.Model, tea.Cmd) {
@@ -258,6 +287,7 @@ func (m model) runCommand(command string) (tea.Model, tea.Cmd) {
 	default:
 		m.history = append(m.history, message{author: "Watson", content: "Unknown command: " + command})
 	}
+	m.trimHistory()
 	m.refreshHistory()
 	m.viewport.GotoBottom()
 
@@ -294,6 +324,7 @@ func (m *model) cancel() {
 func (m *model) appendHistory(entry message) {
 	follow := m.viewport.AtBottom()
 	m.history = append(m.history, entry)
+	m.trimHistory()
 	m.refreshHistory()
 	if follow {
 		m.viewport.GotoBottom()
@@ -318,11 +349,46 @@ func (m *model) refreshHistory() {
 
 func (m *model) resize() {
 	panelWidth := panelContentWidth(m.width)
+	isHistoryWidthChanged := m.viewport.Width() != panelWidth
 	m.input.SetHeight(inputHeight(m.input.Value()))
 	m.viewport.SetWidth(panelWidth)
 	m.viewport.SetHeight(max(m.height-statusHeight()-panelStyle.GetVerticalFrameSize()*2-m.input.Height(), minimumComponentSize))
 	m.input.SetWidth(panelWidth)
-	m.refreshHistory()
+	if isHistoryWidthChanged {
+		m.refreshHistory()
+	}
+}
+
+func (m *model) trimHistory() {
+	totalChars := 0
+	for _, entry := range m.history {
+		totalChars += utf8.RuneCountInString(entry.content)
+	}
+
+	for totalChars > m.historyLimit && len(m.history) > 2 {
+		totalChars -= utf8.RuneCountInString(m.history[1].content)
+		m.history = append(m.history[:1], m.history[2:]...)
+	}
+	if totalChars <= m.historyLimit || len(m.history) < 2 {
+		return
+	}
+
+	last := len(m.history) - 1
+	otherChars := totalChars - utf8.RuneCountInString(m.history[last].content)
+	m.history[last].content = truncateText(m.history[last].content, max(m.historyLimit-otherChars, 0))
+}
+
+func truncateText(text string, limit int) string {
+	runes := []rune(text)
+	if len(runes) <= limit {
+		return text
+	}
+	if limit == 0 {
+		return ""
+	}
+
+	runes[limit-1] = '…'
+	return string(runes[:limit])
 }
 
 func panelContentWidth(width int) int {
@@ -330,12 +396,6 @@ func panelContentWidth(width int) int {
 }
 
 func (m *model) request(turnID int, question string) tea.Cmd {
-	if m.client == nil {
-		return tea.Tick(responseDelay, func(time.Time) tea.Msg {
-			return responseMsg{id: turnID, response: "Echo: " + question}
-		})
-	}
-
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	m.cancelRequest = cancel

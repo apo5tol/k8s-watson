@@ -53,7 +53,11 @@ func TestRunApplicationWrapsDiagnosticsInitializationError(t *testing.T) {
 	values.DebugLog = filepath.Join(t.TempDir(), "missing", "diagnostics.log")
 	values.DebugLogSet = true
 
-	err := runApplication(values, changedFlags(t, values.Model, values.DebugLog), func(tui.Client) error { return nil })
+	err := runApplication(
+		values,
+		changedFlags(t, values.Model, values.DebugLog),
+		func(tui.Client, int) error { return nil },
+	)
 	if err == nil || !strings.Contains(err.Error(), "initialize diagnostics") {
 		t.Errorf("runApplication() error = %v, want diagnostics initialization error", err)
 	}
@@ -63,9 +67,26 @@ func TestRunApplicationLogsLifecycle(t *testing.T) {
 	values := testConfigValues()
 	values.DebugLog = filepath.Join(t.TempDir(), "diagnostics.log")
 	values.DebugLogSet = true
+	runCalled := false
 
-	if err := runApplication(values, changedFlags(t, values.Model, values.DebugLog), func(tui.Client) error { return nil }); err != nil {
+	if err := runApplication(
+		values,
+		changedFlags(t, values.Model, values.DebugLog),
+		func(client tui.Client, maxHistoryChars int) error {
+			runCalled = true
+			if client == nil {
+				t.Error("TUI client = nil, want Ollama client")
+			}
+			if maxHistoryChars != config.DefaultMaxHistoryChars {
+				t.Errorf("history limit = %d, want %d", maxHistoryChars, config.DefaultMaxHistoryChars)
+			}
+			return nil
+		},
+	); err != nil {
 		t.Fatalf("runApplication() error = %v", err)
+	}
+	if !runCalled {
+		t.Fatal("TUI runner was not called")
 	}
 	contents, err := os.ReadFile(values.DebugLog)
 	if err != nil {

@@ -6,12 +6,15 @@ import (
 	"testing"
 	"time"
 
+	"charm.land/bubbles/v2/spinner"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 )
 
+const testMaxHistoryChars = 65_536
+
 func TestViewUsesFullScreenAndFillsViewport(t *testing.T) {
-	m := newModel()
+	m := newTestModel()
 	view := m.View()
 
 	if !view.AltScreen {
@@ -26,7 +29,7 @@ func TestViewUsesFullScreenAndFillsViewport(t *testing.T) {
 }
 
 func TestInputHeightGrowsToThreeLines(t *testing.T) {
-	m := newModel()
+	m := newTestModel()
 
 	if got := m.input.Height(); got != minimumInputHeight {
 		t.Errorf("empty input height = %d, want %d", got, minimumInputHeight)
@@ -40,7 +43,7 @@ func TestInputHeightGrowsToThreeLines(t *testing.T) {
 }
 
 func TestEnterSubmitsQuestionFromReadyState(t *testing.T) {
-	m := newModel()
+	m := newTestModel()
 	m.input.SetValue("show pods")
 
 	updated, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
@@ -54,9 +57,41 @@ func TestEnterSubmitsQuestionFromReadyState(t *testing.T) {
 	}
 }
 
+func TestSubmittingQuestionStartsSpinner(t *testing.T) {
+	m := newTestModel()
+	m.input.SetValue("show pods")
+
+	updated, cmd := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatal("submit command = nil, want spinner and request commands")
+	}
+	msg := cmd()
+	batch, ok := msg.(tea.BatchMsg)
+	if !ok {
+		t.Fatalf("submit command message = %T, want tea.BatchMsg", msg)
+	}
+
+	var tick spinner.TickMsg
+	for _, batchCmd := range batch {
+		if msg, ok := batchCmd().(spinner.TickMsg); ok {
+			tick = msg
+			break
+		}
+	}
+	if tick.ID == 0 {
+		t.Fatal("submit batch does not contain spinner tick")
+	}
+
+	got := updated.(model)
+	_, nextTick := got.Update(tick)
+	if nextTick == nil {
+		t.Fatal("processing spinner did not schedule next tick")
+	}
+}
+
 func TestEnterIgnoresEmptyAndConcurrentQuestions(t *testing.T) {
 	t.Run("empty input", func(t *testing.T) {
-		m := newModel()
+		m := newTestModel()
 
 		got := updateModel(t, m, tea.KeyPressMsg{Code: tea.KeyEnter})
 		if got.state != stateReady || len(got.history) != 1 {
@@ -65,7 +100,7 @@ func TestEnterIgnoresEmptyAndConcurrentQuestions(t *testing.T) {
 	})
 
 	t.Run("processing input", func(t *testing.T) {
-		m := newModel()
+		m := newTestModel()
 		m.state = stateProcessing
 		m.input.SetValue("second question")
 
@@ -77,7 +112,7 @@ func TestEnterIgnoresEmptyAndConcurrentQuestions(t *testing.T) {
 }
 
 func TestCtrlJAddsNewline(t *testing.T) {
-	m := newModel()
+	m := newTestModel()
 	m.input.SetValue("first")
 
 	updated, _ := m.Update(tea.KeyPressMsg{Code: 'j', Mod: tea.ModCtrl})
@@ -89,7 +124,7 @@ func TestCtrlJAddsNewline(t *testing.T) {
 }
 
 func TestShiftEnterAddsNewline(t *testing.T) {
-	m := newModel()
+	m := newTestModel()
 	m.input.SetValue("first")
 
 	updated, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter, Mod: tea.ModShift})
@@ -106,7 +141,7 @@ func TestCancelKeysClearInputOrCancelRequest(t *testing.T) {
 		{Code: 'c', Mod: tea.ModCtrl},
 	} {
 		t.Run(key.String(), func(t *testing.T) {
-			m := newModel()
+			m := newTestModel()
 			m.input.SetValue("draft")
 
 			got := updateModel(t, m, key)
@@ -114,7 +149,7 @@ func TestCancelKeysClearInputOrCancelRequest(t *testing.T) {
 				t.Errorf("idle cancel input = %q, state = %q, history = %#v; want cleared ready input", got.input.Value(), got.state, got.history)
 			}
 
-			m = newModel()
+			m = newTestModel()
 			m.state = stateProcessing
 			m.turnID = 4
 			got = updateModel(t, m, key)
@@ -126,7 +161,7 @@ func TestCancelKeysClearInputOrCancelRequest(t *testing.T) {
 }
 
 func TestResponseCompletesOnlyCurrentRequest(t *testing.T) {
-	m := newModel()
+	m := newTestModel()
 	m.state = stateProcessing
 	m.turnID = 3
 
@@ -157,7 +192,7 @@ func TestSlashCommands(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			m := newModel()
+			m := newTestModel()
 			m.state = test.state
 			m.input.SetValue(test.command)
 
@@ -178,7 +213,7 @@ func TestQuitCommandsReturnQuitMessage(t *testing.T) {
 		{Code: tea.KeyEnter},
 	} {
 		t.Run(key.String(), func(t *testing.T) {
-			m := newModel()
+			m := newTestModel()
 			if key.Code == tea.KeyEnter {
 				m.input.SetValue("/quit")
 			}
@@ -205,12 +240,19 @@ func TestQuitCancelsAndWaitsForActiveRequest(t *testing.T) {
 			return "", ctx.Err()
 		},
 	}
-	m := newModel(client)
+	m := newModel(client, testMaxHistoryChars)
 	m.input.SetValue("show pods")
 
 	updated, request := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	m = updated.(model)
-	go request()
+	requestMsg := request()
+	batch, ok := requestMsg.(tea.BatchMsg)
+	if !ok {
+		t.Fatalf("request command message = %T, want tea.BatchMsg", requestMsg)
+	}
+	for _, cmd := range batch {
+		go cmd()
+	}
 	<-requestStarted
 
 	updated, quit := m.Update(tea.KeyPressMsg{Code: 'q', Mod: tea.ModCtrl})
@@ -245,8 +287,41 @@ func TestQuitCancelsAndWaitsForActiveRequest(t *testing.T) {
 	}
 }
 
+func TestShutdownMessageCancelsAndWaitsForActiveRequest(t *testing.T) {
+	m := newTestModel()
+	m.state = stateProcessing
+	cancelled := false
+	m.cancelRequest = func() { cancelled = true }
+	done := make(chan struct{})
+	close(done)
+	m.requestDone = done
+
+	updated, cmd := m.Update(shutdownMsg{})
+	got := updated.(model)
+	if !cancelled {
+		t.Fatal("shutdown did not cancel active request")
+	}
+	if got.turnID != 1 {
+		t.Errorf("turn ID = %d, want 1", got.turnID)
+	}
+	msg := cmd()
+	if _, ok := msg.(quitMsg); !ok {
+		t.Errorf("shutdown command message = %T, want tui.quitMsg", msg)
+	}
+}
+
+func TestRunRejectsInvalidDependencies(t *testing.T) {
+	if err := Run(nil, testMaxHistoryChars); err == nil {
+		t.Error("Run(nil) error = nil, want error")
+	}
+	client := blockingClient{ask: func(context.Context, string) (string, error) { return "", nil }}
+	if err := Run(client, 0); err == nil {
+		t.Error("Run() with zero history limit error = nil, want error")
+	}
+}
+
 func TestResizeUpdatesComponentDimensions(t *testing.T) {
-	m := newModel()
+	m := newTestModel()
 	m.input.SetValue("one\ntwo\nthree")
 
 	got := updateModel(t, m, tea.WindowSizeMsg{Width: 100, Height: 30})
@@ -264,7 +339,7 @@ func TestResizeUpdatesComponentDimensions(t *testing.T) {
 }
 
 func TestViewShowsCurrentStatus(t *testing.T) {
-	m := newModel()
+	m := newTestModel()
 	if view := m.View().Content; !strings.Contains(view, "Status: ready") {
 		t.Errorf("ready view = %q, want ready status", view)
 	}
@@ -276,7 +351,7 @@ func TestViewShowsCurrentStatus(t *testing.T) {
 }
 
 func TestLongResponseStaysWithinWindowAndHistoryCanScroll(t *testing.T) {
-	m := updateModel(t, newModel(), tea.WindowSizeMsg{Width: 100, Height: 30})
+	m := updateModel(t, newTestModel(), tea.WindowSizeMsg{Width: 100, Height: 30})
 	m.state = stateProcessing
 	m.turnID = 1
 
@@ -301,7 +376,7 @@ func TestLongResponseStaysWithinWindowAndHistoryCanScroll(t *testing.T) {
 }
 
 func TestLongResponseRemainsScrollableAfterResize(t *testing.T) {
-	m := updateModel(t, newModel(), tea.WindowSizeMsg{Width: 100, Height: 30})
+	m := updateModel(t, newTestModel(), tea.WindowSizeMsg{Width: 100, Height: 30})
 	m.state = stateProcessing
 	m.turnID = 1
 
@@ -321,6 +396,23 @@ func TestLongResponseRemainsScrollableAfterResize(t *testing.T) {
 	}
 }
 
+func TestHistoryDropsOldEntriesAndTruncatesLatestEntry(t *testing.T) {
+	m := newModel(blockingClient{
+		ask: func(context.Context, string) (string, error) {
+			return "response", nil
+		},
+	}, 10)
+	m.appendHistory(message{author: "You", content: "123456"})
+	m.appendHistory(message{author: "Watson", content: "abcdefghijk"})
+
+	if len(m.history) != 2 {
+		t.Fatalf("history = %#v, want logo and latest entry", m.history)
+	}
+	if got := m.history[1].content; got != "abcdefghi…" {
+		t.Errorf("latest history entry = %q, want truncated entry", got)
+	}
+}
+
 func updateModel(t *testing.T, m model, msg tea.Msg) model {
 	t.Helper()
 	updated, _ := m.Update(msg)
@@ -333,4 +425,12 @@ type blockingClient struct {
 
 func (c blockingClient) Ask(ctx context.Context, question string) (string, error) {
 	return c.ask(ctx, question)
+}
+
+func newTestModel() model {
+	return newModel(blockingClient{
+		ask: func(context.Context, string) (string, error) {
+			return "response", nil
+		},
+	}, testMaxHistoryChars)
 }

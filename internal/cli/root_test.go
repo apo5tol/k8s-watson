@@ -27,7 +27,7 @@ func TestExecuteExitCodes(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
-			if got := execute(test.args, &stdout, &stderr, func(tui.Client) error { return nil }); got != test.want {
+			if got := execute(test.args, &stdout, &stderr, func(tui.Client, int) error { return nil }); got != test.want {
 				t.Errorf("Execute(%v) = %d, want %d; stderr = %q", test.args, got, test.want, stderr.String())
 			}
 			if test.wantStderr != "" && stderr.String() != test.wantStderr {
