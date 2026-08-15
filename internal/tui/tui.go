@@ -62,6 +62,8 @@ type responseMsg struct {
 	err      error
 }
 
+type quitMsg struct{}
+
 type Client interface {
 	Ask(context.Context, string) (string, error)
 }
@@ -70,6 +72,7 @@ type model struct {
 	history       []message
 	client        Client
 	cancelRequest context.CancelFunc
+	requestDone   <-chan struct{}
 	input         textarea.Model
 	viewport      viewport.Model
 	spinner       spinner.Model
@@ -134,6 +137,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.resize()
+	case quitMsg:
+		return m, tea.Quit
 	case responseMsg:
 		if msg.id != m.turnID || m.state != stateProcessing {
 			return m, nil
@@ -184,7 +189,7 @@ func (m model) View() tea.View {
 func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "ctrl+q":
-		return m, tea.Quit
+		return m, m.quit()
 	case "esc", "ctrl+c":
 		if m.state == stateProcessing {
 			m.cancel()
@@ -249,7 +254,7 @@ func (m model) runCommand(command string) (tea.Model, tea.Cmd) {
 	case "/clear":
 		m.history = []message{{content: logo}}
 	case "/quit":
-		return m, tea.Quit
+		return m, m.quit()
 	default:
 		m.history = append(m.history, message{author: "Watson", content: "Unknown command: " + command})
 	}
@@ -257,6 +262,23 @@ func (m model) runCommand(command string) (tea.Model, tea.Cmd) {
 	m.viewport.GotoBottom()
 
 	return m, nil
+}
+
+func (m *model) quit() tea.Cmd {
+	if m.cancelRequest == nil {
+		return tea.Quit
+	}
+
+	m.cancelRequest()
+	m.cancelRequest = nil
+	m.turnID++
+	done := m.requestDone
+	m.requestDone = nil
+
+	return func() tea.Msg {
+		<-done
+		return quitMsg{}
+	}
 }
 
 func (m *model) cancel() {
@@ -315,8 +337,11 @@ func (m *model) request(turnID int, question string) tea.Cmd {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
 	m.cancelRequest = cancel
+	m.requestDone = done
 	return func() tea.Msg {
+		defer close(done)
 		response, err := m.client.Ask(ctx, question)
 		return responseMsg{id: turnID, response: response, err: err}
 	}

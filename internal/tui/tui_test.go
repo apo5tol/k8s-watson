@@ -1,8 +1,10 @@
 package tui
 
 import (
+	"context"
 	"strings"
 	"testing"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
@@ -192,6 +194,57 @@ func TestQuitCommandsReturnQuitMessage(t *testing.T) {
 	}
 }
 
+func TestQuitCancelsAndWaitsForActiveRequest(t *testing.T) {
+	requestStarted := make(chan struct{})
+	requestCancelled := make(chan struct{})
+	client := blockingClient{
+		ask: func(ctx context.Context, _ string) (string, error) {
+			close(requestStarted)
+			<-ctx.Done()
+			close(requestCancelled)
+			return "", ctx.Err()
+		},
+	}
+	m := newModel(client)
+	m.input.SetValue("show pods")
+
+	updated, request := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	m = updated.(model)
+	go request()
+	<-requestStarted
+
+	updated, quit := m.Update(tea.KeyPressMsg{Code: 'q', Mod: tea.ModCtrl})
+	m = updated.(model)
+	if m.turnID != 2 {
+		t.Errorf("turn ID = %d, want 2", m.turnID)
+	}
+
+	quitResult := make(chan tea.Msg, 1)
+	go func() {
+		quitResult <- quit()
+	}()
+
+	select {
+	case <-requestCancelled:
+	case <-time.After(time.Second):
+		t.Fatal("active request was not cancelled")
+	}
+
+	select {
+	case msg := <-quitResult:
+		if _, ok := msg.(quitMsg); !ok {
+			t.Fatalf("quit command message = %T, want tui.quitMsg", msg)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("quit command did not wait for request completion")
+	}
+
+	_, cmd := m.Update(quitMsg{})
+	if _, ok := cmd().(tea.QuitMsg); !ok {
+		t.Errorf("quit message command = %T, want tea.QuitMsg", cmd())
+	}
+}
+
 func TestResizeUpdatesComponentDimensions(t *testing.T) {
 	m := newModel()
 	m.input.SetValue("one\ntwo\nthree")
@@ -272,4 +325,12 @@ func updateModel(t *testing.T, m model, msg tea.Msg) model {
 	t.Helper()
 	updated, _ := m.Update(msg)
 	return updated.(model)
+}
+
+type blockingClient struct {
+	ask func(context.Context, string) (string, error)
+}
+
+func (c blockingClient) Ask(ctx context.Context, question string) (string, error) {
+	return c.ask(ctx, question)
 }
