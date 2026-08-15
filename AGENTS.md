@@ -6,6 +6,10 @@
 
 Project documentation is stored in `docs/` and must be read before starting work.
 
+# Search
+
+When searching for files or text, do not honor `.gitignore`; use `rg --no-ignore` or an equivalent option.
+
 # Code Comments
 
 Do not add comments that merely restate what the code, identifier, type, or function signature already makes clear. Use comments only to explain non-obvious rationale, constraints, or behavior.
