@@ -1,6 +1,6 @@
 # k8s-watson
 
-`k8s-watson` is a terminal assistant for diagnosing and analysing Kubernetes clusters with an Ollama model.
+`k8s-watson` is an AI-powered assistant for diagnosing and analysing Kubernetes clusters.
 
 > [!WARNING]
 > The project is under active development and is currently an alpha version. Its behaviour and interface may change.
