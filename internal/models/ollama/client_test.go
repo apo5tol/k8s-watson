@@ -11,6 +11,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"k8s-watson/internal/agent"
+	"k8s-watson/internal/models"
 )
 
 func TestClientChatReturnsCompletedResponse(t *testing.T) {
@@ -21,12 +24,93 @@ func TestClientChatReturnsCompletedResponse(t *testing.T) {
 	defer server.Close()
 
 	client := newTestClient(t, server.URL, time.Second)
-	got, err := client.Chat(context.Background(), "show pods")
+	got, err := client.Chat(context.Background(), testRequest())
 	if err != nil {
 		t.Fatalf("Chat() error = %v", err)
 	}
-	if got != "pods are healthy" {
-		t.Errorf("Chat() = %q, want %q", got, "pods are healthy")
+	if got.Text != "pods are healthy" {
+		t.Errorf("Chat() text = %q, want %q", got.Text, "pods are healthy")
+	}
+}
+
+func TestClientChatConvertsAgentProtocol(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request chatRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		assertProtocolRequest(t, request)
+		writeResponse(t, w, chatResponse{
+			Message: chatMessage{
+				Content: "I will inspect the pods.",
+				ToolCalls: []chatToolCall{
+					{Function: chatToolFunction{Name: "kubectl", Arguments: []byte(`{"verb":"get","args":["pods"]}`)}},
+					{Function: chatToolFunction{Name: "kubectl", Arguments: []byte(`{"verb":"describe","args":["pod","api"]}`)}},
+				},
+			},
+			Done: true,
+		})
+	}))
+	defer server.Close()
+
+	client := newTestClient(t, server.URL, time.Second)
+	response, err := client.Chat(context.Background(), models.Request{
+		Messages: []agent.Message{
+			{Role: agent.RoleSystem, Content: "use tools"},
+			{Role: agent.RoleUser, Content: "show pods"},
+			{Role: agent.RoleAssistant, ToolCalls: []agent.ToolCall{{ID: "call-1", Name: "kubectl", Arguments: []byte(`{"verb":"get"}`)}}},
+			{Role: agent.RoleTool, ToolResult: &agent.ToolResult{ToolCallID: "call-1", ToolName: "kubectl", Content: "pods"}},
+		},
+		Tools: []agent.ToolDefinition{{
+			Name:        "kubectl",
+			Description: "Run kubectl",
+			InputSchema: []byte(`{"type":"object"}`),
+		}},
+	})
+	if err != nil {
+		t.Fatalf("Chat() error = %v", err)
+	}
+	assertProtocolResponse(t, response)
+}
+
+func assertProtocolRequest(t *testing.T, request chatRequest) {
+	t.Helper()
+	if len(request.Messages) != 4 {
+		t.Fatalf("messages = %#v, want four messages", request.Messages)
+	}
+	assertProtocolMessages(t, request.Messages)
+	if len(request.Tools) != 1 || request.Tools[0].Type != "function" || request.Tools[0].Function.Name != "kubectl" {
+		t.Errorf("tools = %#v, want kubectl function", request.Tools)
+	}
+}
+
+func assertProtocolMessages(t *testing.T, messages []chatMessage) {
+	t.Helper()
+	if messages[0].Role != "system" || messages[0].Content != "use tools" {
+		t.Errorf("system message = %#v, want system instruction", messages[0])
+	}
+	if messages[2].Role != "assistant" || len(messages[2].ToolCalls) != 1 {
+		t.Errorf("assistant message = %#v, want tool call", messages[2])
+	}
+	toolCall := messages[2].ToolCalls[0].Function
+	if toolCall.Index == nil || *toolCall.Index != 0 || string(toolCall.Arguments) != `{"verb":"get"}` {
+		t.Errorf("tool call = %#v, want indexed arguments", messages[2].ToolCalls[0])
+	}
+	if messages[3].Role != "tool" || messages[3].ToolName != "kubectl" || messages[3].Content != "pods" {
+		t.Errorf("tool result = %#v, want Ollama tool message", messages[3])
+	}
+}
+
+func assertProtocolResponse(t *testing.T, response models.Response) {
+	t.Helper()
+	if response.Text != "I will inspect the pods." || len(response.ToolCalls) != 2 {
+		t.Fatalf("response = %#v, want text and two tool calls", response)
+	}
+	if response.ToolCalls[0].ID == response.ToolCalls[1].ID || response.ToolCalls[0].ID == "" {
+		t.Errorf("tool call IDs = %#v, want unique non-empty IDs", response.ToolCalls)
+	}
+	if response.ToolCalls[0].Name != "kubectl" || string(response.ToolCalls[1].Arguments) != `{"verb":"describe","args":["pod","api"]}` {
+		t.Errorf("tool calls = %#v, want decoded calls", response.ToolCalls)
 	}
 }
 
@@ -48,12 +132,12 @@ func TestClientChatRetriesTemporaryErrors(t *testing.T) {
 		return nil
 	}
 
-	got, err := client.Chat(context.Background(), "show pods")
+	got, err := client.Chat(context.Background(), testRequest())
 	if err != nil {
 		t.Fatalf("Chat() error = %v", err)
 	}
-	if got != "recovered" {
-		t.Errorf("Chat() = %q, want recovered", got)
+	if got.Text != "recovered" {
+		t.Errorf("Chat() text = %q, want recovered", got.Text)
 	}
 	if got := calls.Load(); got != maxAttempts {
 		t.Errorf("requests = %d, want %d", got, maxAttempts)
@@ -71,7 +155,7 @@ func TestClientChatTimeout(t *testing.T) {
 
 	client := newTestClient(t, server.URL, 10*time.Millisecond)
 	client.sleep = func(context.Context, time.Duration) error { return nil }
-	_, err := client.Chat(context.Background(), "show pods")
+	_, err := client.Chat(context.Background(), testRequest())
 	assertErrorKind(t, err, ErrorTimeout)
 }
 
@@ -94,7 +178,7 @@ func TestClientChatCancellationStopsRetry(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	errs := make(chan error, 1)
-	go func() { _, err := client.Chat(ctx, "show pods"); errs <- err }()
+	go func() { _, err := client.Chat(ctx, testRequest()); errs <- err }()
 	<-retrying
 	cancel()
 
@@ -124,7 +208,7 @@ func TestClientChatCancellationInterruptsRequest(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	errs := make(chan error, 1)
 	go func() {
-		_, err := client.Chat(ctx, "show pods")
+		_, err := client.Chat(ctx, testRequest())
 		errs <- err
 	}()
 	<-requestStarted
@@ -144,6 +228,8 @@ func TestClientChatRejectsInvalidResponses(t *testing.T) {
 		body string
 	}{
 		{name: "empty content", body: `{"message":{"content":"  "},"done":true}`},
+		{name: "tool call without name", body: `{"message":{"tool_calls":[{"function":{"arguments":{}}}]},"done":true}`},
+		{name: "tool call with invalid arguments", body: `{"message":{"tool_calls":[{"function":{"name":"kubectl","arguments":[]}}]},"done":true}`},
 		{name: "incomplete", body: `{"message":{"content":"working"},"done":false}`},
 		{name: "invalid JSON", body: `{`},
 	}
@@ -157,7 +243,7 @@ func TestClientChatRejectsInvalidResponses(t *testing.T) {
 			defer server.Close()
 
 			client := newTestClient(t, server.URL, time.Second)
-			_, err := client.Chat(context.Background(), "show pods")
+			_, err := client.Chat(context.Background(), testRequest())
 			assertErrorKind(t, err, ErrorInvalidResponse)
 		})
 	}
@@ -170,7 +256,7 @@ func TestClientChatRejectsOversizedResponse(t *testing.T) {
 	defer server.Close()
 
 	client := newTestClient(t, server.URL, time.Second)
-	_, err := client.Chat(context.Background(), "show pods")
+	_, err := client.Chat(context.Background(), testRequest())
 	assertErrorKind(t, err, ErrorInvalidResponse)
 }
 
@@ -187,7 +273,7 @@ func TestClientChatDoesNotRetryRequestErrors(t *testing.T) {
 		t.Fatal("retry delay called for request error")
 		return nil
 	}
-	_, err := client.Chat(context.Background(), "show pods")
+	_, err := client.Chat(context.Background(), testRequest())
 	assertErrorKind(t, err, ErrorRequest)
 	if got := calls.Load(); got != 1 {
 		t.Errorf("requests = %d, want 1", got)
@@ -206,7 +292,7 @@ func TestClientChatDoesNotRetryPermanentTransportErrors(t *testing.T) {
 		return nil
 	}
 
-	_, err := client.Chat(context.Background(), "show pods")
+	_, err := client.Chat(context.Background(), testRequest())
 	assertErrorKind(t, err, ErrorRequest)
 	if got := calls.Load(); got != 1 {
 		t.Errorf("requests = %d, want 1", got)
@@ -226,6 +312,16 @@ func newTestClient(t *testing.T, endpoint string, timeout time.Duration) *Client
 	return client
 }
 
+func testRequest() models.Request {
+	return models.Request{
+		Messages: []agent.Message{{
+			Role:    agent.RoleUser,
+			Content: "show pods",
+		}},
+		Tools: []agent.ToolDefinition{},
+	}
+}
+
 func assertChatRequest(t *testing.T, r *http.Request) {
 	t.Helper()
 	if r.URL.Path != "/api/chat" {
@@ -239,7 +335,7 @@ func assertChatRequest(t *testing.T, r *http.Request) {
 	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 		t.Fatalf("decode request: %v", err)
 	}
-	if request.Model != "llama3" || len(request.Messages) != 1 || request.Messages[0] != (chatMessage{Role: "user", Content: "show pods"}) {
+	if request.Model != "llama3" || len(request.Messages) != 1 || request.Messages[0].Role != "user" || request.Messages[0].Content != "show pods" {
 		t.Errorf("request = %#v, want model and one user message", request)
 	}
 	if request.Stream == nil || *request.Stream || request.Think == nil || *request.Think {

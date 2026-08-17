@@ -3,17 +3,16 @@ package chat
 import (
 	"context"
 	"errors"
+
+	"k8s-watson/internal/agent"
+	"k8s-watson/internal/models"
 )
 
-type Model interface {
-	Chat(context.Context, string) (string, error)
-}
-
 type Service struct {
-	model Model
+	model models.Model
 }
 
-func New(model Model) (*Service, error) {
+func New(model models.Model) (*Service, error) {
 	if model == nil {
 		return nil, errors.New("chat model is required")
 	}
@@ -22,5 +21,19 @@ func New(model Model) (*Service, error) {
 }
 
 func (s *Service) Ask(ctx context.Context, question string) (string, error) {
-	return s.model.Chat(ctx, question)
+	response, err := s.model.Chat(ctx, models.Request{
+		Messages: []agent.Message{{
+			Role:    agent.RoleUser,
+			Content: question,
+		}},
+		Tools: []agent.ToolDefinition{},
+	})
+	if err != nil {
+		return "", err
+	}
+	if len(response.ToolCalls) != 0 {
+		return "", errors.New("chat service does not support tool calls")
+	}
+
+	return response.Text, nil
 }
