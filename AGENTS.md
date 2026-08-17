@@ -6,6 +6,8 @@
 
 Project documentation is stored in `docs/` and must be read before starting work.
 
+Commit messages and Git operations must follow [the commit convention](docs/COMMITS.md).
+
 # Search
 
 When searching for files or text, do not honor `.gitignore`; use `rg --no-ignore` or an equivalent option.
