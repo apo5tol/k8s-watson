@@ -56,7 +56,7 @@ func TestRunApplicationWrapsDiagnosticsInitializationError(t *testing.T) {
 	err := runApplication(
 		values,
 		changedFlags(t, values.Model, values.DebugLog),
-		func(tui.Client, int) error { return nil },
+		func(tui.Engine) error { return nil },
 	)
 	if err == nil || !strings.Contains(err.Error(), "initialize diagnostics") {
 		t.Errorf("runApplication() error = %v, want diagnostics initialization error", err)
@@ -72,13 +72,10 @@ func TestRunApplicationLogsLifecycle(t *testing.T) {
 	if err := runApplication(
 		values,
 		changedFlags(t, values.Model, values.DebugLog),
-		func(client tui.Client, maxHistoryChars int) error {
+		func(engine tui.Engine) error {
 			runCalled = true
-			if client == nil {
-				t.Error("TUI client = nil, want Ollama client")
-			}
-			if maxHistoryChars != config.DefaultMaxHistoryChars {
-				t.Errorf("history limit = %d, want %d", maxHistoryChars, config.DefaultMaxHistoryChars)
+			if engine == nil {
+				t.Error("TUI engine = nil, want chat engine")
 			}
 			return nil
 		},

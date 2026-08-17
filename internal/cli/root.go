@@ -16,7 +16,7 @@ const (
 	autoDebugLogFlagValue = "__auto_debug_log__"
 )
 
-type tuiRunner func(tui.Client, int) error
+type tuiRunner func(tui.Engine) error
 
 func Execute(args []string, stdout, stderr io.Writer) int {
 	return execute(args, stdout, stderr, tui.Run)

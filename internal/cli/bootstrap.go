@@ -37,12 +37,17 @@ func runApplication(values config.Values, flags *pflag.FlagSet, runTUI tuiRunner
 	if err != nil {
 		return fmt.Errorf("initialize Ollama client: %w", err)
 	}
-	chatService, err := chat.New(model)
+	engine, err := chat.New(model, chat.Config{
+		MaxHistoryChars: loadedConfig.MaxHistoryChars,
+		MaxInputBytes:   16 * 1024,
+		MaxIterations:   loadedConfig.MaxIterations,
+	}, logger)
 	if err != nil {
-		return fmt.Errorf("initialize chat service: %w", err)
+		return fmt.Errorf("initialize chat engine: %w", err)
 	}
+	defer engine.Close()
 
-	return runTUI(chatService, loadedConfig.MaxHistoryChars)
+	return runTUI(engine)
 }
 
 func valuesFromFlags(values config.Values, flags *pflag.FlagSet) config.Values {

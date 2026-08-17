@@ -1,20 +1,20 @@
 package tui
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
-	"unicode/utf8"
 
 	"charm.land/bubbles/v2/spinner"
 	"charm.land/bubbles/v2/textarea"
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+
+	"k8s-watson/internal/chat"
 )
 
 const (
@@ -47,58 +47,41 @@ var (
 	appStyle    = lipgloss.NewStyle().Background(lipgloss.Color(colorBackground)).Foreground(lipgloss.Color(colorText))
 )
 
-type message struct {
+type Engine interface {
+	Submit(string) error
+	Cancel() bool
+	Clear() error
+	Snapshot() chat.Snapshot
+	Events() <-chan chat.Event
+	Close()
+}
+
+type eventMsg struct{ event chat.Event }
+type quitMsg struct{}
+type shutdownMsg struct{}
+
+type notice struct {
 	author  string
 	content string
 }
 
-type turnState string
-
-const (
-	stateReady      turnState = "ready"
-	stateProcessing turnState = "processing"
-)
-
-type responseMsg struct {
-	id       int
-	response string
-	err      error
-}
-
-type quitMsg struct{}
-type shutdownMsg struct{}
-
-type Client interface {
-	Ask(context.Context, string) (string, error)
-}
-
 type model struct {
-	history       []message
-	client        Client
-	cancelRequest context.CancelFunc
-	requestDone   <-chan struct{}
-	input         textarea.Model
-	viewport      viewport.Model
-	spinner       spinner.Model
-	width         int
-	height        int
-	state         turnState
-	turnID        int
-	historyLimit  int
+	engine   Engine
+	snapshot chat.Snapshot
+	notices  []notice
+	input    textarea.Model
+	viewport viewport.Model
+	spinner  spinner.Model
+	width    int
+	height   int
 }
 
-func Run(client Client, maxHistoryChars int) error {
-	if client == nil {
-		return errors.New("TUI client is required")
-	}
-	if maxHistoryChars <= 0 {
-		return errors.New("TUI history limit must be positive")
+func Run(engine Engine) error {
+	if engine == nil {
+		return errors.New("TUI engine is required")
 	}
 
-	program := tea.NewProgram(
-		newModel(client, maxHistoryChars),
-		tea.WithoutSignalHandler(),
-	)
+	program := tea.NewProgram(newModel(engine), tea.WithoutSignalHandler())
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(signals)
@@ -116,11 +99,10 @@ func Run(client Client, maxHistoryChars int) error {
 	if _, err := program.Run(); err != nil {
 		return fmt.Errorf("run TUI: %w", err)
 	}
-
 	return nil
 }
 
-func newModel(client Client, maxHistoryChars int) model {
+func newModel(engine Engine) model {
 	input := textarea.New()
 	input.Placeholder = "Ask a question about Kubernetes…"
 	input.Focus()
@@ -133,28 +115,23 @@ func newModel(client Client, maxHistoryChars int) model {
 	spinnerModel.Style = lipgloss.NewStyle().Foreground(lipgloss.Color(colorAccent))
 
 	m := model{
-		history: []message{{content: logo}},
-		client:  client,
-		input:   input,
-		viewport: viewport.New(
-			viewport.WithWidth(panelContentWidth(defaultWidth)),
-			viewport.WithHeight(minimumComponentSize),
-		),
-		spinner:      spinnerModel,
-		width:        defaultWidth,
-		height:       defaultHeight,
-		state:        stateReady,
-		historyLimit: maxHistoryChars,
+		engine:   engine,
+		snapshot: engine.Snapshot(),
+		notices:  []notice{},
+		input:    input,
+		viewport: viewport.New(viewport.WithWidth(panelContentWidth(defaultWidth)), viewport.WithHeight(minimumComponentSize)),
+		spinner:  spinnerModel,
+		width:    defaultWidth,
+		height:   defaultHeight,
 	}
 	m.viewport.FillHeight = true
 	m.refreshHistory()
 	m.resize()
-
 	return m
 }
 
 func (m model) Init() tea.Cmd {
-	return textarea.Blink
+	return tea.Batch(textarea.Blink, m.waitEvent())
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -167,20 +144,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 	case shutdownMsg:
 		return m, m.quit()
-	case responseMsg:
-		if msg.id != m.turnID || m.state != stateProcessing {
-			return m, nil
+	case eventMsg:
+		follow := m.viewport.AtBottom()
+		m.snapshot = msg.event.Snapshot
+		m.refreshHistory()
+		if follow {
+			m.viewport.GotoBottom()
 		}
-		m.cancelRequest = nil
-		if msg.err != nil {
-			m.appendHistory(message{author: "Watson", content: "Request failed: " + msg.err.Error()})
-		} else {
-			m.appendHistory(message{author: "Watson", content: msg.response})
-		}
-		m.state = stateReady
-		return m, nil
+		return m, m.waitEvent()
 	case spinner.TickMsg:
-		if m.state == stateProcessing {
+		if m.snapshot.State.Active() {
 			var cmd tea.Cmd
 			m.spinner, cmd = m.spinner.Update(msg)
 			return m, cmd
@@ -192,25 +165,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var inputCmd, viewportCmd tea.Cmd
 	m.input, inputCmd = m.input.Update(msg)
 	m.viewport, viewportCmd = m.viewport.Update(msg)
-
 	return m, tea.Batch(inputCmd, viewportCmd)
 }
 
 func (m model) View() tea.View {
 	history := panelStyle.Width(m.width - panelHorizontalMargin).Render(m.viewport.View())
-	status := statusStyle.Render("Status: " + string(m.state))
-	if m.state == stateProcessing {
-		status = statusStyle.Render(m.spinner.View() + " Status: " + string(m.state))
+	status := statusStyle.Render("Status: " + string(m.snapshot.State))
+	if m.snapshot.State.Active() {
+		status = statusStyle.Render(m.spinner.View() + " Status: " + string(m.snapshot.State))
 	}
 	input := panelStyle.Width(m.width - panelHorizontalMargin).Render(m.input.View())
-
 	view := tea.NewView(appStyle.Render(lipgloss.JoinVertical(lipgloss.Left, history, status, input)))
 	view.AltScreen = true
 	view.BackgroundColor = lipgloss.Color(colorBackground)
 	view.ForegroundColor = lipgloss.Color(colorText)
 	view.KeyboardEnhancements.ReportAllKeysAsEscapeCodes = true
 	view.MouseMode = tea.MouseModeCellMotion
-
 	return view
 }
 
@@ -219,8 +189,10 @@ func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case "ctrl+q":
 		return m, m.quit()
 	case "esc", "ctrl+c":
-		if m.state == stateProcessing {
-			m.cancel()
+		if m.snapshot.State.Active() {
+			m.engine.Cancel()
+			m.snapshot = m.engine.Snapshot()
+			m.refreshHistory()
 			return m, nil
 		}
 		if m.input.Value() != "" {
@@ -240,7 +212,6 @@ func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	m.input, inputCmd = m.input.Update(msg)
 	m.viewport, viewportCmd = m.viewport.Update(msg)
 	m.resize()
-
 	return m, tea.Batch(inputCmd, viewportCmd)
 }
 
@@ -249,29 +220,19 @@ func (m model) submit() (tea.Model, tea.Cmd) {
 	if question == "" {
 		return m, nil
 	}
-	if m.state != stateReady {
-		if question == "/clear" {
-			m.input.Reset()
-			m.appendHistory(message{author: "Watson", content: "Cannot clear history while a request is active. Cancel it first."})
-		}
-		return m, nil
-	}
-
 	if strings.HasPrefix(question, "/") {
 		return m.runCommand(question)
 	}
-
-	m.history = append(m.history, message{author: "You", content: question})
-	m.trimHistory()
+	if err := m.engine.Submit(question); err != nil {
+		m.appendNotice("Request failed: " + err.Error())
+		return m, nil
+	}
 	m.input.Reset()
 	m.resize()
-	m.state = stateProcessing
-	m.turnID++
+	m.snapshot = m.engine.Snapshot()
 	m.refreshHistory()
 	m.viewport.GotoBottom()
-	turnID := m.turnID
-
-	return m, tea.Batch(m.spinner.Tick, m.request(turnID, question))
+	return m, m.spinner.Tick
 }
 
 func (m model) runCommand(command string) (tea.Model, tea.Cmd) {
@@ -279,70 +240,64 @@ func (m model) runCommand(command string) (tea.Model, tea.Cmd) {
 	m.resize()
 	switch command {
 	case "/help":
-		m.history = append(m.history, message{author: "Watson", content: "Commands: /help, /clear, /quit\nKeys: Enter send; Ctrl+J newline; Esc cancel; Ctrl+Q quit."})
+		m.appendNotice("Commands: /help, /clear, /quit\nKeys: Enter send; Ctrl+J newline; Esc cancel; Ctrl+Q quit.")
 	case "/clear":
-		m.history = []message{{content: logo}}
+		if err := m.engine.Clear(); err != nil {
+			m.appendNotice("Cannot clear history while a request is active. Cancel it first.")
+			return m, nil
+		}
+		m.snapshot = m.engine.Snapshot()
+		m.notices = []notice{}
+		m.refreshHistory()
 	case "/quit":
 		return m, m.quit()
 	default:
-		m.history = append(m.history, message{author: "Watson", content: "Unknown command: " + command})
+		m.appendNotice("Unknown command: " + command)
 	}
-	m.trimHistory()
-	m.refreshHistory()
 	m.viewport.GotoBottom()
-
 	return m, nil
 }
 
-func (m *model) quit() tea.Cmd {
-	if m.cancelRequest == nil {
-		return tea.Quit
-	}
-
-	m.cancelRequest()
-	m.cancelRequest = nil
-	m.turnID++
-	done := m.requestDone
-	m.requestDone = nil
-
-	return func() tea.Msg {
-		<-done
-		return quitMsg{}
-	}
-}
-
-func (m *model) cancel() {
-	if m.cancelRequest != nil {
-		m.cancelRequest()
-		m.cancelRequest = nil
-	}
-	m.turnID++
-	m.state = stateReady
-	m.appendHistory(message{author: "Watson", content: "Request cancelled."})
-}
-
-func (m *model) appendHistory(entry message) {
+func (m *model) appendNotice(content string) {
 	follow := m.viewport.AtBottom()
-	m.history = append(m.history, entry)
-	m.trimHistory()
+	m.notices = append(m.notices, notice{author: "Watson", content: content})
 	m.refreshHistory()
 	if follow {
 		m.viewport.GotoBottom()
 	}
 }
 
+func (m model) quit() tea.Cmd {
+	return func() tea.Msg {
+		m.engine.Close()
+		return quitMsg{}
+	}
+}
+
+func (m model) waitEvent() tea.Cmd {
+	return func() tea.Msg {
+		event := <-m.engine.Events()
+		return eventMsg{event: event}
+	}
+}
+
 func (m *model) refreshHistory() {
-	entries := make([]string, 0, len(m.history))
-	for _, entry := range m.history {
-		if entry.author == "" {
-			entries = append(entries, headerStyle.Render(entry.content))
-			continue
+	entries := []string{headerStyle.Render(logo)}
+	for _, entry := range m.snapshot.Entries {
+		author := "Watson"
+		style := botStyle
+		if entry.Kind == chat.EntryUser {
+			author = "You"
+			style = userStyle
 		}
-		author := botStyle.Render(entry.author)
+		entries = append(entries, style.Render(author)+"\n"+entry.Text)
+	}
+	for _, entry := range m.notices {
+		style := botStyle
 		if entry.author == "You" {
-			author = userStyle.Render(entry.author)
+			style = userStyle
 		}
-		entries = append(entries, author+"\n"+entry.content)
+		entries = append(entries, style.Render(entry.author)+"\n"+entry.content)
 	}
 	m.viewport.SetContent(lipgloss.Wrap(strings.Join(entries, "\n\n"), m.viewport.Width(), ""))
 }
@@ -359,57 +314,11 @@ func (m *model) resize() {
 	}
 }
 
-func (m *model) trimHistory() {
-	totalChars := 0
-	for _, entry := range m.history {
-		totalChars += utf8.RuneCountInString(entry.content)
-	}
-
-	for totalChars > m.historyLimit && len(m.history) > 2 {
-		totalChars -= utf8.RuneCountInString(m.history[1].content)
-		m.history = append(m.history[:1], m.history[2:]...)
-	}
-	if totalChars <= m.historyLimit || len(m.history) < 2 {
-		return
-	}
-
-	last := len(m.history) - 1
-	otherChars := totalChars - utf8.RuneCountInString(m.history[last].content)
-	m.history[last].content = truncateText(m.history[last].content, max(m.historyLimit-otherChars, 0))
-}
-
-func truncateText(text string, limit int) string {
-	runes := []rune(text)
-	if len(runes) <= limit {
-		return text
-	}
-	if limit == 0 {
-		return ""
-	}
-
-	runes[limit-1] = '…'
-	return string(runes[:limit])
-}
-
 func panelContentWidth(width int) int {
 	return max(width-panelHorizontalMargin-panelStyle.GetHorizontalFrameSize(), minimumComponentSize)
 }
 
-func (m *model) request(turnID int, question string) tea.Cmd {
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	m.cancelRequest = cancel
-	m.requestDone = done
-	return func() tea.Msg {
-		defer close(done)
-		response, err := m.client.Ask(ctx, question)
-		return responseMsg{id: turnID, response: response, err: err}
-	}
-}
-
-func statusHeight() int {
-	return 1
-}
+func statusHeight() int { return 1 }
 
 func inputHeight(value string) int {
 	return min(maximumInputHeight, max(minimumInputHeight, strings.Count(value, "\n")+1))
@@ -421,7 +330,6 @@ func darculaInputStyles() textarea.Styles {
 	text := lipgloss.Color(colorText)
 	mutedText := lipgloss.Color(colorMutedText)
 	accent := lipgloss.Color(colorAccent)
-
 	styles.Focused.Base = styles.Focused.Base.Background(background)
 	styles.Focused.Text = styles.Focused.Text.Foreground(text).Background(background)
 	styles.Focused.Prompt = styles.Focused.Prompt.Foreground(accent).Background(background)
@@ -432,6 +340,5 @@ func darculaInputStyles() textarea.Styles {
 	styles.Blurred.Prompt = styles.Blurred.Prompt.Foreground(accent).Background(background)
 	styles.Blurred.Placeholder = styles.Blurred.Placeholder.Foreground(mutedText).Background(background)
 	styles.Cursor.Color = lipgloss.Color(colorCursor)
-
 	return styles
 }
