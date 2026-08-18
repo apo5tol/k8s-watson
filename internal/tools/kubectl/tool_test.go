@@ -73,7 +73,11 @@ func TestPrepareRejectsForbiddenCalls(t *testing.T) {
 		verb string
 		args []string
 	}{
-		{name: "forbidden verb", verb: "exec"},
+		{name: "edit", verb: "edit"},
+		{name: "port forward", verb: "port-forward"},
+		{name: "attach", verb: "attach"},
+		{name: "proxy", verb: "proxy"},
+		{name: "exec", verb: "exec"},
 		{name: "forbidden verb case insensitive", verb: "Edit"},
 		{name: "shell pipe", verb: "get", args: []string{"pods|cat"}},
 		{name: "shell redirect", verb: "get", args: []string{"pods>output"}},
@@ -161,7 +165,7 @@ func TestPrepareSetsApprovalAndDisplay(t *testing.T) {
 	}{
 		{verb: "get"},
 		{verb: "describe"},
-		{verb: "list", requiresApproval: true},
+		{verb: "list"},
 		{verb: "logs", requiresApproval: true},
 		{verb: "GET", requiresApproval: true},
 	}
@@ -183,6 +187,25 @@ func TestPrepareSetsApprovalAndDisplay(t *testing.T) {
 	}
 	if got, expected := prepared.Display(), `kubectl get 'pod name' 'it'"'"'s'`; got != expected {
 		t.Errorf("Display() = %q, want %q", got, expected)
+	}
+}
+
+func TestPreparePreservesArgumentsForExecutor(t *testing.T) {
+	executor := &fakeExecutor{result: agent.ToolResult{Content: "ok"}}
+	args := []string{"pods", "-n", "monitoring"}
+	prepared, err := New(executor).Prepare(context.Background(), toolCall("get", args))
+	if err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	if len(executor.calls) != 0 {
+		t.Fatalf("Prepare() executed %d calls, want none", len(executor.calls))
+	}
+
+	if _, err := prepared.Execute(context.Background()); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if got, want := executor.calls, [][]string{{"kubectl", "get", "pods", "-n", "monitoring"}}; !reflect.DeepEqual(got, want) {
+		t.Errorf("Execute() argv = %#v, want %#v", got, want)
 	}
 }
 

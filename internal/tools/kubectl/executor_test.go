@@ -47,6 +47,15 @@ func TestExecutorCapturesOutput(t *testing.T) {
 	}
 }
 
+func TestExecutorRejectsEmptyArguments(t *testing.T) {
+	executor := testExecutor(t, time.Second, 1024)
+
+	_, err := executor.Execute(context.Background(), nil)
+	if !errors.Is(err, ErrInvalidExecutor) {
+		t.Errorf("Execute() error = %v, want ErrInvalidExecutor", err)
+	}
+}
+
 func TestExecutorTruncatesCombinedOutput(t *testing.T) {
 	executor := testExecutor(t, time.Second, 5)
 
@@ -56,6 +65,30 @@ func TestExecutorTruncatesCombinedOutput(t *testing.T) {
 	}
 	if !strings.HasSuffix(result.Content, "[output truncated]") {
 		t.Errorf("Execute() content = %q, want truncation marker", result.Content)
+	}
+}
+
+func TestCombinedOutputRespectsLimitBoundary(t *testing.T) {
+	output := newCombinedOutput(5)
+	if _, err := output.stdoutWriter().Write([]byte("abc")); err != nil {
+		t.Fatalf("write stdout: %v", err)
+	}
+	if _, err := output.stderrWriter().Write([]byte("de")); err != nil {
+		t.Fatalf("write stderr: %v", err)
+	}
+	result := output.result()
+	if result.Truncated {
+		t.Error("result marked truncated at exact output limit")
+	}
+	if result.Stdout != "abc" || result.Stderr != "de" {
+		t.Errorf("result = %#v, want stdout abc and stderr de", result)
+	}
+
+	if _, err := output.stdoutWriter().Write([]byte("f")); err != nil {
+		t.Fatalf("write excess stdout: %v", err)
+	}
+	if result := output.result(); !result.Truncated || result.Stdout != "abc" || result.Stderr != "de" {
+		t.Errorf("result after excess = %#v, want preserved output with truncation", result)
 	}
 }
 
@@ -75,23 +108,47 @@ func TestExecutorReturnsExitError(t *testing.T) {
 	}
 }
 
+func TestExecutorReturnsTruncatedExitError(t *testing.T) {
+	executor := testExecutor(t, time.Second, 3)
+
+	_, err := executor.Execute(context.Background(), helperArguments("large-failure"))
+	var executionError *ExecutionError
+	if !errors.As(err, &executionError) {
+		t.Fatalf("Execute() error = %v, want ExecutionError", err)
+	}
+	if !executionError.Truncated {
+		t.Error("ExecutionError.Truncated = false, want true")
+	}
+	if len(executionError.Stderr) > 3 {
+		t.Errorf("ExecutionError.Stderr = %q, exceeds output limit", executionError.Stderr)
+	}
+}
+
 func TestExecutorHonorsTimeout(t *testing.T) {
 	executor := testExecutor(t, 10*time.Millisecond, 1024)
 
+	startedAt := time.Now()
 	_, err := executor.Execute(context.Background(), helperArguments("sleep"))
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("Execute() error = %v, want context deadline exceeded", err)
+	}
+	if elapsed := time.Since(startedAt); elapsed >= 500*time.Millisecond {
+		t.Errorf("Execute() returned after %s, want before helper sleep completes", elapsed)
 	}
 }
 
 func TestExecutorHonorsCancelledContext(t *testing.T) {
 	executor := testExecutor(t, time.Second, 1024)
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
+	time.AfterFunc(20*time.Millisecond, cancel)
+	startedAt := time.Now()
 
-	_, err := executor.Execute(ctx, helperArguments("output"))
+	_, err := executor.Execute(ctx, helperArguments("sleep"))
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("Execute() error = %v, want context canceled", err)
+	}
+	if elapsed := time.Since(startedAt); elapsed >= 500*time.Millisecond {
+		t.Errorf("Execute() returned after %s, want before helper sleep completes", elapsed)
 	}
 }
 
@@ -129,6 +186,9 @@ func TestExecutorHelperProcess(t *testing.T) {
 			_, _ = fmt.Fprint(os.Stderr, "ghijkl")
 		case "failure":
 			_, _ = fmt.Fprint(os.Stderr, "failed")
+			os.Exit(3)
+		case "large-failure":
+			_, _ = fmt.Fprint(os.Stderr, "abcdef")
 			os.Exit(3)
 		case "sleep":
 			time.Sleep(time.Second)

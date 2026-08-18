@@ -95,7 +95,7 @@ func (t *Tool) Prepare(_ context.Context, call agent.ToolCall) (tools.PreparedCa
 	return preparedCall{
 		argv:             argv,
 		display:          quoteCommand(argv),
-		requiresApproval: input.verb != "get" && input.verb != "describe",
+		requiresApproval: input.verb != "get" && input.verb != "describe" && input.verb != "list",
 		metadata:         metadata,
 		executor:         t.executor,
 	}, nil
