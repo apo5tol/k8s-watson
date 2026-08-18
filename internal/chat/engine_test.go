@@ -10,6 +10,7 @@ import (
 
 	"k8s-watson/internal/agent"
 	"k8s-watson/internal/models"
+	"k8s-watson/internal/tools"
 )
 
 type fakeModel struct {
@@ -20,9 +21,34 @@ func (m fakeModel) Chat(ctx context.Context, request models.Request) (models.Res
 	return m.chat(ctx, request)
 }
 
-func testEngine(t *testing.T, model models.Model) *Engine {
+type fakeTool struct {
+	definition agent.ToolDefinition
+	prepare    func(context.Context, agent.ToolCall) (tools.PreparedCall, error)
+}
+
+func (t fakeTool) Definition() agent.ToolDefinition {
+	return t.definition
+}
+
+func (t fakeTool) Prepare(ctx context.Context, call agent.ToolCall) (tools.PreparedCall, error) {
+	return t.prepare(ctx, call)
+}
+
+type fakePreparedCall struct {
+	execute func(context.Context) (agent.ToolResult, error)
+}
+
+func (c fakePreparedCall) Execute(ctx context.Context) (agent.ToolResult, error) {
+	return c.execute(ctx)
+}
+
+func testEngine(t *testing.T, model models.Model, registeredTools ...tools.Tool) *Engine {
 	t.Helper()
-	engine, err := New(model, Config{MaxHistoryChars: 100, MaxInputBytes: 16 * 1024, MaxIterations: 8}, nil)
+	registry, err := tools.NewRegistry(registeredTools...)
+	if err != nil {
+		t.Fatalf("NewRegistry() error = %v", err)
+	}
+	engine, err := New(model, registry, Config{MaxHistoryChars: 100, MaxInputBytes: 16 * 1024, MaxIterations: 8}, nil)
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -42,11 +68,18 @@ func waitEvent(t *testing.T, engine *Engine) Event {
 }
 
 func TestNewRejectsInvalidDependencies(t *testing.T) {
-	if _, err := New(nil, Config{MaxHistoryChars: 1, MaxInputBytes: 1, MaxIterations: 1}, nil); !errors.Is(err, ErrModelRequired) {
+	registry, err := tools.NewRegistry()
+	if err != nil {
+		t.Fatalf("NewRegistry() error = %v", err)
+	}
+	if _, err := New(nil, registry, Config{MaxHistoryChars: 1, MaxInputBytes: 1, MaxIterations: 1}, nil); !errors.Is(err, ErrModelRequired) {
 		t.Errorf("New(nil) error = %v, want ErrModelRequired", err)
 	}
-	if _, err := New(fakeModel{}, Config{}, nil); !errors.Is(err, ErrInvalidConfig) {
+	if _, err := New(fakeModel{}, registry, Config{}, nil); !errors.Is(err, ErrInvalidConfig) {
 		t.Errorf("New() error = %v, want ErrInvalidConfig", err)
+	}
+	if _, err := New(fakeModel{}, nil, Config{MaxHistoryChars: 1, MaxInputBytes: 1, MaxIterations: 1}, nil); !errors.Is(err, tools.ErrRegistryRequired) {
+		t.Errorf("New() error = %v, want tools.ErrRegistryRequired", err)
 	}
 }
 
@@ -164,17 +197,66 @@ func TestEngineReportsModelFailureAndAcceptsNextQuestion(t *testing.T) {
 	}
 }
 
-func TestEngineRejectsToolCalls(t *testing.T) {
-	engine := testEngine(t, fakeModel{chat: func(context.Context, models.Request) (models.Response, error) {
-		return models.Response{ToolCalls: []agent.ToolCall{{ID: "call-1", Name: "kubectl", Arguments: []byte(`{}`)}}}, nil
-	}})
+func TestEngineRunsToolCallsAndReturnsResultsToModel(t *testing.T) {
+	var requests []models.Request
+	var executions int
+	tool := fakeTool{
+		definition: agent.ToolDefinition{Name: "fake", Description: "fake tool"},
+		prepare: func(_ context.Context, call agent.ToolCall) (tools.PreparedCall, error) {
+			if string(call.Arguments) != `{"value":"pods"}` {
+				t.Errorf("arguments = %s, want pods", call.Arguments)
+			}
+			return fakePreparedCall{execute: func(context.Context) (agent.ToolResult, error) {
+				executions++
+				return agent.ToolResult{Content: "pod list"}, nil
+			}}, nil
+		},
+	}
+	engine := testEngine(t, fakeModel{chat: func(_ context.Context, request models.Request) (models.Response, error) {
+		requests = append(requests, request)
+		if len(requests) == 1 {
+			return models.Response{ToolCalls: []agent.ToolCall{{ID: "call-1", Name: "fake", Arguments: []byte(`{"value":"pods"}`)}}}, nil
+		}
+		return models.Response{Text: "pods are healthy"}, nil
+	}}, tool)
 	if err := engine.Submit("show pods"); err != nil {
 		t.Fatalf("Submit() error = %v", err)
 	}
 	waitEvent(t, engine)
-	event := waitEvent(t, engine)
-	if !errors.Is(event.Err, ErrToolCallsUnsupported) || event.Kind != EventTurnFailed {
-		t.Errorf("event = %#v, want unsupported tool call failure", event)
+	waitForCompletion(t, engine)
+	assertToolLoop(t, executions, requests)
+}
+
+func waitForCompletion(t *testing.T, engine *Engine) {
+	t.Helper()
+	for event := waitEvent(t, engine); event.Kind != EventTurnCompleted; event = waitEvent(t, engine) {
+	}
+}
+
+func assertToolLoop(t *testing.T, executions int, requests []models.Request) {
+	t.Helper()
+	if executions != 1 || len(requests) != 2 {
+		t.Fatalf("executions = %d, requests = %d, want one execution and two requests", executions, len(requests))
+	}
+	assertToolDefinition(t, requests[0])
+	assertToolResult(t, requests[1].Messages)
+}
+
+func assertToolDefinition(t *testing.T, request models.Request) {
+	t.Helper()
+	if len(request.Tools) != 1 || request.Tools[0].Name != "fake" {
+		t.Errorf("first request tools = %#v, want fake definition", request.Tools)
+	}
+}
+
+func assertToolResult(t *testing.T, messages []agent.Message) {
+	t.Helper()
+	if len(messages) != 4 || messages[2].Role != agent.RoleAssistant || len(messages[2].ToolCalls) != 1 {
+		t.Fatalf("second request messages = %#v, want assistant tool call", messages)
+	}
+	result := messages[3].ToolResult
+	if messages[3].Role != agent.RoleTool || result == nil || result.ToolCallID != "call-1" || result.ToolName != "fake" || result.Content != "pod list" {
+		t.Errorf("tool result = %#v, want matched fake result", result)
 	}
 }
 
@@ -302,7 +384,7 @@ func TestEngineEnforcesInputByteLimit(t *testing.T) {
 	engine, err := New(fakeModel{chat: func(context.Context, models.Request) (models.Response, error) {
 		requests++
 		return models.Response{Text: "answer"}, nil
-	}}, Config{MaxHistoryChars: 100, MaxInputBytes: 4, MaxIterations: 8}, nil)
+	}}, mustRegistry(t), Config{MaxHistoryChars: 100, MaxInputBytes: 4, MaxIterations: 8}, nil)
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -319,6 +401,15 @@ func TestEngineEnforcesInputByteLimit(t *testing.T) {
 	if requests != 1 {
 		t.Errorf("model requests = %d, want rejected input not sent to model", requests)
 	}
+}
+
+func mustRegistry(t *testing.T, registeredTools ...tools.Tool) *tools.Registry {
+	t.Helper()
+	registry, err := tools.NewRegistry(registeredTools...)
+	if err != nil {
+		t.Fatalf("NewRegistry() error = %v", err)
+	}
+	return registry
 }
 
 func TestEngineRejectsBusySubmitAndActiveClear(t *testing.T) {

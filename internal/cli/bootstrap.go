@@ -11,6 +11,7 @@ import (
 	"k8s-watson/internal/config"
 	"k8s-watson/internal/diagnostics"
 	"k8s-watson/internal/models/ollama"
+	"k8s-watson/internal/tools"
 )
 
 func runApplication(values config.Values, flags *pflag.FlagSet, runTUI tuiRunner) (returnErr error) {
@@ -37,7 +38,11 @@ func runApplication(values config.Values, flags *pflag.FlagSet, runTUI tuiRunner
 	if err != nil {
 		return fmt.Errorf("initialize Ollama client: %w", err)
 	}
-	engine, err := chat.New(model, chat.Config{
+	registry, err := tools.NewRegistry()
+	if err != nil {
+		return fmt.Errorf("initialize tool registry: %w", err)
+	}
+	engine, err := chat.New(model, registry, chat.Config{
 		MaxHistoryChars: loadedConfig.MaxHistoryChars,
 		MaxInputBytes:   16 * 1024,
 		MaxIterations:   loadedConfig.MaxIterations,
