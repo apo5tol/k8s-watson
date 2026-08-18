@@ -33,6 +33,12 @@ docs: document commit convention
 feat(config)!: rename model environment variable
 ```
 
+## Commit Scope
+
+- Each commit must contain isolated changes within a single scope.
+- Split unrelated changes, or changes affecting different scopes, into separate
+  commits.
+
 ## Git Operation Rules
 
 - Create a commit only when the user explicitly requests it.
