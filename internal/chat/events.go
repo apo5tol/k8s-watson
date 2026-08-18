@@ -13,9 +13,16 @@ const (
 )
 
 type Snapshot struct {
-	State   State
-	TurnID  TurnID
-	Entries []Entry
+	State    State
+	TurnID   TurnID
+	Entries  []Entry
+	Approval *Approval
+}
+
+type Approval struct {
+	Command   string
+	Context   string
+	Namespace string
 }
 
 type Event struct {

@@ -18,6 +18,8 @@ type fakeEngine struct {
 	clearErr  error
 	cancelled bool
 	closed    bool
+	approved  bool
+	rejected  bool
 }
 
 func newFakeEngine() *fakeEngine {
@@ -44,6 +46,16 @@ func (e *fakeEngine) Clear() error {
 		return e.clearErr
 	}
 	e.snapshot = chat.Snapshot{State: chat.StateIdle, Entries: []chat.Entry{}}
+	return nil
+}
+
+func (e *fakeEngine) Approve() error {
+	e.approved = true
+	return nil
+}
+
+func (e *fakeEngine) Reject() error {
+	e.rejected = true
 	return nil
 }
 
@@ -89,6 +101,21 @@ func TestCancelDelegatesToEngine(t *testing.T) {
 	got := updated.(model)
 	if !engine.cancelled || got.snapshot.State != chat.StateCancelled {
 		t.Errorf("cancelled = %t, snapshot = %#v; want engine cancellation", engine.cancelled, got.snapshot)
+	}
+}
+
+func TestApprovalKeysDelegateToEngine(t *testing.T) {
+	engine := newFakeEngine()
+	engine.snapshot.State = chat.StateAwaitingApproval
+	m := newModel(engine)
+
+	m.Update(tea.KeyPressMsg{Text: "y"})
+	if !engine.approved {
+		t.Error("y did not approve the pending command")
+	}
+	m.Update(tea.KeyPressMsg{Text: "n"})
+	if !engine.rejected {
+		t.Error("n did not reject the pending command")
 	}
 }
 

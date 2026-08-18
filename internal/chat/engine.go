@@ -33,6 +33,7 @@ type Engine struct {
 	nextID     TurnID
 	generation uint64
 	cancel     context.CancelFunc
+	pending    *pendingTool
 	closed     bool
 	events     chan Event
 }
@@ -97,13 +98,13 @@ func (e *Engine) Submit(question string) error {
 	e.logger.Info("chat turn started", "event", "chat_turn_started", "turn_id", turn.ID)
 
 	e.wg.Add(1)
-	go e.runTurn(ctx, generation, turn.ID)
+	go e.runTurn(ctx, generation, turn.ID, 0)
 	return nil
 }
 
-func (e *Engine) runTurn(ctx context.Context, generation uint64, turnID TurnID) {
+func (e *Engine) runTurn(ctx context.Context, generation uint64, turnID TurnID, iteration int) {
 	defer e.wg.Done()
-	for iteration := 0; ; iteration++ {
+	for ; ; iteration++ {
 		if iteration >= e.config.MaxIterations {
 			e.failTurn(generation, turnID, ErrMaxIterations)
 			return
@@ -126,10 +127,8 @@ func (e *Engine) runTurn(ctx context.Context, generation uint64, turnID TurnID) 
 			return
 		}
 
-		for _, call := range response.ToolCalls {
-			if !e.runTool(ctx, generation, turnID, call) {
-				return
-			}
+		if !e.runToolCalls(ctx, generation, turnID, response.ToolCalls) {
+			return
 		}
 	}
 }
@@ -175,31 +174,82 @@ func (e *Engine) handleModelResponse(generation uint64, turnID TurnID, response 
 	return true
 }
 
-func (e *Engine) runTool(ctx context.Context, generation uint64, turnID TurnID, call agent.ToolCall) bool {
+func (e *Engine) runToolCalls(ctx context.Context, generation uint64, turnID TurnID, calls []agent.ToolCall) bool {
+	for _, call := range calls {
+		prepared, ok := e.prepareTool(ctx, generation, turnID, call)
+		if !ok {
+			return false
+		}
+		if prepared.RequiresApproval() {
+			if !e.waitForApproval(ctx, generation, turnID, prepared) {
+				return false
+			}
+		}
+		if !e.executeTool(ctx, generation, turnID, call, prepared) {
+			return false
+		}
+	}
+	return true
+}
+
+func (e *Engine) prepareTool(ctx context.Context, generation uint64, turnID TurnID, call agent.ToolCall) (tools.PreparedCall, bool) {
 	tool, err := e.registry.Find(call.Name)
 	if err != nil {
 		e.failTurn(generation, turnID, err)
-		return false
+		return nil, false
 	}
 
 	prepared, err := tool.Prepare(ctx, call)
 	if err != nil {
 		e.failTurn(generation, turnID, fmt.Errorf("prepare tool %q: %w", call.Name, err))
+		return nil, false
+	}
+	return prepared, true
+}
+
+func (e *Engine) waitForApproval(ctx context.Context, generation uint64, turnID TurnID, prepared tools.PreparedCall) bool {
+	e.mu.Lock()
+	if !e.isActiveLocked(generation, turnID) {
+		e.mu.Unlock()
 		return false
 	}
+	e.pending = &pendingTool{
+		prepared: prepared,
+		decision: make(chan bool, 1),
+		turnID:   turnID,
+	}
+	e.state = StateAwaitingApproval
+	e.publishLocked(EventStateChanged, turnID, nil)
+	pending := e.pending
+	e.mu.Unlock()
 
+	select {
+	case approved := <-pending.decision:
+		return approved
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func (e *Engine) executeTool(ctx context.Context, generation uint64, turnID TurnID, call agent.ToolCall, prepared tools.PreparedCall) bool {
 	e.mu.Lock()
 	if !e.isActiveLocked(generation, turnID) {
 		e.mu.Unlock()
 		return false
 	}
 	e.state = StateRunningTool
-	e.publishLocked(EventStateChanged, turnID, nil)
+	turn := &e.turns[len(e.turns)-1]
+	turn.Entries = append(turn.Entries, Entry{
+		Kind:   EntryTool,
+		Text:   "Running command:\n" + prepared.Display(),
+		TurnID: turnID,
+	})
+	e.publishLocked(EventHistoryChanged, turnID, nil)
 	e.mu.Unlock()
 
 	result, err := prepared.Execute(ctx)
 	if err != nil {
-		e.failTurn(generation, turnID, fmt.Errorf("execute tool %q: %w", call.Name, err))
+		e.failTool(generation, turnID, call, prepared, err)
 		return false
 	}
 	result.ToolCallID = call.ID
@@ -210,11 +260,52 @@ func (e *Engine) runTool(ctx context.Context, generation uint64, turnID TurnID, 
 	if !e.isActiveLocked(generation, turnID) || e.state != StateRunningTool {
 		return false
 	}
-	turn := &e.turns[len(e.turns)-1]
-	turn.Messages = append(turn.Messages, agent.Message{Role: agent.RoleTool, ToolResult: &result})
+	activeTurn := &e.turns[len(e.turns)-1]
+	activeTurn.Messages = append(activeTurn.Messages, agent.Message{Role: agent.RoleTool, ToolResult: &result})
 	e.state = StateToolProposed
 	e.publishLocked(EventHistoryChanged, turnID, nil)
 	return true
+}
+
+func (e *Engine) Approve() error {
+	return e.resolveApproval(true)
+}
+
+func (e *Engine) Reject() error {
+	return e.resolveApproval(false)
+}
+
+func (e *Engine) resolveApproval(approved bool) error {
+	e.mu.Lock()
+	if e.state != StateAwaitingApproval || e.pending == nil {
+		e.mu.Unlock()
+		return ErrNoPendingApproval
+	}
+	pending := e.pending
+	if approved {
+		e.pending = nil
+		e.mu.Unlock()
+		pending.decision <- true
+		return nil
+	}
+	e.pending = nil
+	turn := &e.turns[len(e.turns)-1]
+	turn.Entries = append(turn.Entries, Entry{Kind: EntryRejected, Text: "Command rejected: " + pending.prepared.Display(), TurnID: pending.turnID})
+	e.finishLocked(pending.turnID, StateCompleted, EntryAssistant, "Command was not run.", nil, EventTurnCompleted)
+	e.mu.Unlock()
+	pending.decision <- false
+	return nil
+}
+
+func (e *Engine) failTool(generation uint64, turnID TurnID, _ agent.ToolCall, prepared tools.PreparedCall, err error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if !e.isActiveLocked(generation, turnID) {
+		return
+	}
+	turn := &e.turns[len(e.turns)-1]
+	turn.Entries = append(turn.Entries, Entry{Kind: EntryTool, Text: prepared.Display() + "\n" + err.Error(), TurnID: turnID})
+	e.finishLocked(turnID, StateFailed, EntryError, err.Error(), err, EventTurnFailed)
 }
 
 func (e *Engine) failTurn(generation uint64, turnID TurnID, err error) {
@@ -238,6 +329,7 @@ func (e *Engine) finishLocked(turnID TurnID, state State, kind EntryKind, text s
 	e.state = state
 	e.activeID = 0
 	e.cancel = nil
+	e.pending = nil
 	e.publishLocked(event, turnID, err)
 }
 
@@ -252,6 +344,7 @@ func (e *Engine) Cancel() bool {
 	e.generation++
 	e.cancel()
 	e.cancel = nil
+	e.pending = nil
 	e.finishLocked(turnID, StateCancelled, EntryCancelled, "Request cancelled.", nil, EventTurnCancelled)
 	e.logger.Info("chat turn cancelled", "event", "chat_turn_cancelled", "turn_id", turnID)
 	return true
@@ -318,5 +411,20 @@ func (e *Engine) snapshotLocked() Snapshot {
 	for _, turn := range e.turns {
 		entries = append(entries, turn.Entries...)
 	}
-	return Snapshot{State: e.state, TurnID: e.activeID, Entries: entries}
+	snapshot := Snapshot{State: e.state, TurnID: e.activeID, Entries: entries}
+	if e.pending != nil {
+		metadata := e.pending.prepared.Metadata()
+		snapshot.Approval = &Approval{
+			Command:   e.pending.prepared.Display(),
+			Context:   metadata["context"],
+			Namespace: metadata["namespace"],
+		}
+	}
+	return snapshot
+}
+
+type pendingTool struct {
+	prepared tools.PreparedCall
+	decision chan bool
+	turnID   TurnID
 }

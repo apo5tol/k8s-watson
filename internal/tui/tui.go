@@ -43,6 +43,7 @@ var (
 	panelStyle  = lipgloss.NewStyle().Background(lipgloss.Color(colorPanelBackground)).Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color(colorPanelBorder)).Padding(panelVerticalPadding, panelHorizontalPadding)
 	userStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorUser))
 	botStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorAccent))
+	toolStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorCursor))
 	statusStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMutedText))
 	appStyle    = lipgloss.NewStyle().Background(lipgloss.Color(colorBackground)).Foreground(lipgloss.Color(colorText))
 )
@@ -51,6 +52,8 @@ type Engine interface {
 	Submit(string) error
 	Cancel() bool
 	Clear() error
+	Approve() error
+	Reject() error
 	Snapshot() chat.Snapshot
 	Events() <-chan chat.Event
 	Close()
@@ -171,6 +174,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m model) View() tea.View {
 	history := panelStyle.Width(m.width - panelHorizontalMargin).Render(m.viewport.View())
 	status := statusStyle.Render("Status: " + string(m.snapshot.State))
+	if m.snapshot.Approval != nil {
+		approval := m.snapshot.Approval
+		status = statusStyle.Render(fmt.Sprintf(
+			"Approve command? [y/n] %s (context: %s, namespace: %s)",
+			approval.Command,
+			approval.Context,
+			approval.Namespace,
+		))
+	}
 	if m.snapshot.State.Active() {
 		status = statusStyle.Render(m.spinner.View() + " Status: " + string(m.snapshot.State))
 	}
@@ -185,6 +197,10 @@ func (m model) View() tea.View {
 }
 
 func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	if handled, command := m.handleApprovalKey(msg.String()); handled {
+		return m, command
+	}
+
 	switch msg.String() {
 	case "ctrl+q":
 		return m, m.quit()
@@ -215,6 +231,27 @@ func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(inputCmd, viewportCmd)
 }
 
+func (m *model) handleApprovalKey(key string) (bool, tea.Cmd) {
+	if m.snapshot.State != chat.StateAwaitingApproval {
+		return false, nil
+	}
+
+	switch key {
+	case "y":
+		if err := m.engine.Approve(); err != nil {
+			m.appendNotice("Cannot approve command: " + err.Error())
+		}
+		return true, m.spinner.Tick
+	case "n":
+		if err := m.engine.Reject(); err != nil {
+			m.appendNotice("Cannot reject command: " + err.Error())
+		}
+		return true, nil
+	default:
+		return false, nil
+	}
+}
+
 func (m model) submit() (tea.Model, tea.Cmd) {
 	question := strings.TrimSpace(m.input.Value())
 	if question == "" {
@@ -240,7 +277,7 @@ func (m model) runCommand(command string) (tea.Model, tea.Cmd) {
 	m.resize()
 	switch command {
 	case "/help":
-		m.appendNotice("Commands: /help, /clear, /quit\nKeys: Enter send; Ctrl+J newline; Esc cancel; Ctrl+Q quit.")
+		m.appendNotice("Commands: /help, /clear, /quit\nKeys: Enter send; Ctrl+J newline; y approve; n reject; Esc cancel; Ctrl+Q quit.")
 	case "/clear":
 		if err := m.engine.Clear(); err != nil {
 			m.appendNotice("Cannot clear history while a request is active. Cancel it first.")
@@ -286,9 +323,12 @@ func (m *model) refreshHistory() {
 	for _, entry := range m.snapshot.Entries {
 		author := "Watson"
 		style := botStyle
-		if entry.Kind == chat.EntryUser {
+		switch entry.Kind {
+		case chat.EntryUser:
 			author = "You"
 			style = userStyle
+		case chat.EntryTool:
+			style = toolStyle
 		}
 		entries = append(entries, style.Render(author)+"\n"+entry.Text)
 	}

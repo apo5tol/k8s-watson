@@ -35,15 +35,16 @@ func (t fakeTool) Prepare(ctx context.Context, call agent.ToolCall) (tools.Prepa
 }
 
 type fakePreparedCall struct {
-	execute func(context.Context) (agent.ToolResult, error)
+	requiresApproval bool
+	execute          func(context.Context) (agent.ToolResult, error)
 }
 
 func (fakePreparedCall) Display() string {
 	return "fake"
 }
 
-func (fakePreparedCall) RequiresApproval() bool {
-	return false
+func (c fakePreparedCall) RequiresApproval() bool {
+	return c.requiresApproval
 }
 
 func (fakePreparedCall) Metadata() map[string]string {
@@ -470,5 +471,87 @@ func TestEngineCloseCancelsActiveRequest(t *testing.T) {
 	}
 	if err := engine.Clear(); !errors.Is(err, ErrClosed) {
 		t.Errorf("Clear() error = %v, want ErrClosed", err)
+	}
+}
+
+func TestEngineWaitsForApprovalBeforeExecutingTool(t *testing.T) {
+	var modelCalls int
+	var executions int
+	tool := fakeTool{
+		definition: agent.ToolDefinition{Name: "kubectl"},
+		prepare: func(context.Context, agent.ToolCall) (tools.PreparedCall, error) {
+			return fakePreparedCall{
+				requiresApproval: true,
+				execute: func(context.Context) (agent.ToolResult, error) {
+					executions++
+					return agent.ToolResult{Content: "done"}, nil
+				},
+			}, nil
+		},
+	}
+	engine := testEngine(t, fakeModel{chat: func(context.Context, models.Request) (models.Response, error) {
+		modelCalls++
+		if modelCalls == 1 {
+			return models.Response{ToolCalls: []agent.ToolCall{{ID: "call-1", Name: "kubectl"}}}, nil
+		}
+		return models.Response{Text: "answer"}, nil
+	}}, tool)
+
+	if err := engine.Submit("question"); err != nil {
+		t.Fatalf("Submit() error = %v", err)
+	}
+	for engine.Snapshot().State != StateAwaitingApproval {
+		waitEvent(t, engine)
+	}
+	if executions != 0 {
+		t.Fatalf("executions = %d before approval, want 0", executions)
+	}
+	if err := engine.Approve(); err != nil {
+		t.Fatalf("Approve() error = %v", err)
+	}
+	for engine.Snapshot().State != StateCompleted {
+		waitEvent(t, engine)
+	}
+	if executions != 1 || modelCalls != 2 {
+		t.Errorf("executions = %d, model calls = %d; want 1 and 2", executions, modelCalls)
+	}
+	entries := engine.Snapshot().Entries
+	if len(entries) < 2 || entries[1].Kind != EntryTool || entries[1].Text != "Running command:\nfake" {
+		t.Errorf("entries = %#v, want running tool command after question", entries)
+	}
+}
+
+func TestEngineRejectStopsToolCallPackage(t *testing.T) {
+	var executions int
+	tool := fakeTool{
+		definition: agent.ToolDefinition{Name: "kubectl"},
+		prepare: func(context.Context, agent.ToolCall) (tools.PreparedCall, error) {
+			return fakePreparedCall{
+				requiresApproval: true,
+				execute: func(context.Context) (agent.ToolResult, error) {
+					executions++
+					return agent.ToolResult{}, nil
+				},
+			}, nil
+		},
+	}
+	engine := testEngine(t, fakeModel{chat: func(context.Context, models.Request) (models.Response, error) {
+		return models.Response{ToolCalls: []agent.ToolCall{{ID: "call-1", Name: "kubectl"}, {ID: "call-2", Name: "kubectl"}}}, nil
+	}}, tool)
+
+	if err := engine.Submit("question"); err != nil {
+		t.Fatalf("Submit() error = %v", err)
+	}
+	for engine.Snapshot().State != StateAwaitingApproval {
+		waitEvent(t, engine)
+	}
+	if err := engine.Reject(); err != nil {
+		t.Fatalf("Reject() error = %v", err)
+	}
+	for engine.Snapshot().State != StateCompleted {
+		waitEvent(t, engine)
+	}
+	if executions != 0 {
+		t.Errorf("executions = %d, want 0", executions)
 	}
 }

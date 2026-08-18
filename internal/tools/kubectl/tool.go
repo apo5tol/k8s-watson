@@ -15,6 +15,7 @@ import (
 
 const (
 	toolName          = "kubectl"
+	MetadataContext   = "context"
 	MetadataNamespace = "namespace"
 )
 
@@ -51,10 +52,15 @@ type Executor interface {
 
 type Tool struct {
 	executor Executor
+	resolver TargetResolver
 }
 
-func New(executor Executor) *Tool {
-	return &Tool{executor: executor}
+func New(executor Executor, resolvers ...TargetResolver) *Tool {
+	var resolver TargetResolver
+	if len(resolvers) > 0 {
+		resolver = resolvers[0]
+	}
+	return &Tool{executor: executor, resolver: resolver}
 }
 
 func (*Tool) Definition() agent.ToolDefinition {
@@ -70,7 +76,7 @@ func (*Tool) Definition() agent.ToolDefinition {
 	}
 }
 
-func (t *Tool) Prepare(_ context.Context, call agent.ToolCall) (tools.PreparedCall, error) {
+func (t *Tool) Prepare(ctx context.Context, call agent.ToolCall) (tools.PreparedCall, error) {
 	input, err := decodeCall(call.Arguments)
 	if err != nil {
 		return nil, err
@@ -87,7 +93,16 @@ func (t *Tool) Prepare(_ context.Context, call agent.ToolCall) (tools.PreparedCa
 	argv := make([]string, 0, len(input.args)+2)
 	argv = append(argv, toolName, input.verb)
 	argv = append(argv, input.args...)
+	requiresApproval := input.verb != "get" && input.verb != "describe" && input.verb != "list"
 	metadata := map[string]string{}
+	if requiresApproval && t.resolver != nil {
+		target, err := t.resolver.Resolve(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("resolve kubectl target: %w", err)
+		}
+		metadata[MetadataContext] = target.Context
+		metadata[MetadataNamespace] = target.Namespace
+	}
 	if namespace != "" {
 		metadata[MetadataNamespace] = namespace
 	}
@@ -95,7 +110,7 @@ func (t *Tool) Prepare(_ context.Context, call agent.ToolCall) (tools.PreparedCa
 	return preparedCall{
 		argv:             argv,
 		display:          quoteCommand(argv),
-		requiresApproval: input.verb != "get" && input.verb != "describe" && input.verb != "list",
+		requiresApproval: requiresApproval,
 		metadata:         metadata,
 		executor:         t.executor,
 	}, nil

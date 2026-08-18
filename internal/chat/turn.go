@@ -10,6 +10,8 @@ const (
 	EntryUnknown   EntryKind = ""
 	EntryUser      EntryKind = "user"
 	EntryAssistant EntryKind = "assistant"
+	EntryTool      EntryKind = "tool"
+	EntryRejected  EntryKind = "rejected"
 	EntryError     EntryKind = "error"
 	EntryCancelled EntryKind = "cancelled"
 )

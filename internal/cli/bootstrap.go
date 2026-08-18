@@ -3,6 +3,7 @@ package cli
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"k8s-watson/internal/diagnostics"
 	"k8s-watson/internal/models/ollama"
 	"k8s-watson/internal/tools"
+	"k8s-watson/internal/tools/kubectl"
 )
 
 func runApplication(values config.Values, flags *pflag.FlagSet, runTUI tuiRunner) (returnErr error) {
@@ -53,13 +55,36 @@ func runApplicationWithKubectlLookup(
 	}
 	logger.Info("kubectl found", "event", "kubectl_found", "path", kubectlPath)
 
+	engine, err := newChatEngine(loadedConfig, kubectlPath, logger)
+	if err != nil {
+		return err
+	}
+	defer engine.Close()
+
+	return runTUI(engine)
+}
+
+func newChatEngine(loadedConfig config.Config, kubectlPath string, logger *slog.Logger) (*chat.Engine, error) {
 	model, err := ollama.New(loadedConfig.OllamaURL, loadedConfig.Model, loadedConfig.OllamaTimeout, logger)
 	if err != nil {
-		return fmt.Errorf("initialize Ollama client: %w", err)
+		return nil, fmt.Errorf("initialize Ollama client: %w", err)
 	}
-	registry, err := tools.NewRegistry()
+	executor, err := kubectl.NewExecutor(kubectl.ExecutorConfig{
+		Path:           kubectlPath,
+		Timeout:        loadedConfig.KubectlTimeout,
+		MaxOutputBytes: loadedConfig.MaxToolOutputBytes,
+		Logger:         logger,
+	})
 	if err != nil {
-		return fmt.Errorf("initialize tool registry: %w", err)
+		return nil, fmt.Errorf("initialize kubectl executor: %w", err)
+	}
+	resolver, err := kubectl.NewTargetResolver(kubectlPath, loadedConfig.KubectlTimeout)
+	if err != nil {
+		return nil, fmt.Errorf("initialize kubectl target resolver: %w", err)
+	}
+	registry, err := tools.NewRegistry(kubectl.New(executor, resolver))
+	if err != nil {
+		return nil, fmt.Errorf("initialize tool registry: %w", err)
 	}
 	engine, err := chat.New(model, registry, chat.Config{
 		MaxHistoryChars: loadedConfig.MaxHistoryChars,
@@ -67,11 +92,9 @@ func runApplicationWithKubectlLookup(
 		MaxIterations:   loadedConfig.MaxIterations,
 	}, logger)
 	if err != nil {
-		return fmt.Errorf("initialize chat engine: %w", err)
+		return nil, fmt.Errorf("initialize chat engine: %w", err)
 	}
-	defer engine.Close()
-
-	return runTUI(engine)
+	return engine, nil
 }
 
 func valuesFromFlags(values config.Values, flags *pflag.FlagSet) config.Values {
