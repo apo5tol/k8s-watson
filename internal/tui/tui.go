@@ -182,8 +182,7 @@ func (m model) View() tea.View {
 			approval.Context,
 			approval.Namespace,
 		))
-	}
-	if m.snapshot.State.Active() {
+	} else if m.snapshot.State.Active() {
 		status = statusStyle.Render(m.spinner.View() + " Status: " + string(m.snapshot.State))
 	}
 	input := panelStyle.Width(m.width - panelHorizontalMargin).Render(m.input.View())

@@ -119,6 +119,30 @@ func TestApprovalKeysDelegateToEngine(t *testing.T) {
 	}
 }
 
+func TestViewShowsPendingApproval(t *testing.T) {
+	engine := newFakeEngine()
+	engine.snapshot = chat.Snapshot{
+		State: chat.StateAwaitingApproval,
+		Approval: &chat.Approval{
+			Command:   "kubectl delete pod api-0",
+			Context:   "production",
+			Namespace: "payments",
+		},
+	}
+
+	view := newModel(engine).View().Content
+	for _, want := range []string{
+		"Approve command? [y/n]",
+		"kubectl delete pod api-0",
+		"context: production",
+		"namespace: payments",
+	} {
+		if !strings.Contains(view, want) {
+			t.Errorf("view = %q, want %q", view, want)
+		}
+	}
+}
+
 func TestSlashCommands(t *testing.T) {
 	t.Run("clear", func(t *testing.T) {
 		engine := newFakeEngine()
