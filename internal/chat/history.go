@@ -29,7 +29,7 @@ func contextMessages(turns []Turn, current TurnID, maxChars int) []agent.Message
 		}
 		chars := turnChars(turn)
 		if usedChars+chars > maxChars {
-			continue
+			break
 		}
 		selected = append([]Turn{turn}, selected...)
 		usedChars += chars
