@@ -6,6 +6,7 @@ import (
 	"io"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 
 	"k8s-watson/internal/config"
 	"k8s-watson/internal/tui"
@@ -18,12 +19,24 @@ const (
 
 type tuiRunner func(tui.Engine) error
 
+type applicationRunner func(config.Values, *pflag.FlagSet, tuiRunner) error
+
 func Execute(args []string, stdout, stderr io.Writer) int {
 	return execute(args, stdout, stderr, tui.Run)
 }
 
 func execute(args []string, stdout, stderr io.Writer, runTUI tuiRunner) int {
-	command := newRootCommand(stdout, stderr, runTUI)
+	return executeWithApplicationRunner(args, stdout, stderr, runTUI, runApplication)
+}
+
+func executeWithApplicationRunner(
+	args []string,
+	stdout io.Writer,
+	stderr io.Writer,
+	runTUI tuiRunner,
+	runApplication applicationRunner,
+) int {
+	command := newRootCommand(stdout, stderr, runTUI, runApplication)
 	command.SetArgs(args)
 
 	if err := command.Execute(); err != nil {
@@ -43,10 +56,15 @@ func execute(args []string, stdout, stderr io.Writer, runTUI tuiRunner) int {
 }
 
 func NewRootCommand(stdout, stderr io.Writer) *cobra.Command {
-	return newRootCommand(stdout, stderr, tui.Run)
+	return newRootCommand(stdout, stderr, tui.Run, runApplication)
 }
 
-func newRootCommand(stdout, stderr io.Writer, runTUI tuiRunner) *cobra.Command {
+func newRootCommand(
+	stdout io.Writer,
+	stderr io.Writer,
+	runTUI tuiRunner,
+	runApplication applicationRunner,
+) *cobra.Command {
 	var showVersion bool
 	var values config.Values
 

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -53,10 +54,11 @@ func TestRunApplicationWrapsDiagnosticsInitializationError(t *testing.T) {
 	values.DebugLog = filepath.Join(t.TempDir(), "missing", "diagnostics.log")
 	values.DebugLogSet = true
 
-	err := runApplication(
+	err := runApplicationWithKubectlLookup(
 		values,
 		changedFlags(t, values.Model, values.DebugLog),
 		func(tui.Engine) error { return nil },
+		func(string) (string, error) { return "kubectl", nil },
 	)
 	if err == nil || !strings.Contains(err.Error(), "initialize diagnostics") {
 		t.Errorf("runApplication() error = %v, want diagnostics initialization error", err)
@@ -69,7 +71,7 @@ func TestRunApplicationLogsLifecycle(t *testing.T) {
 	values.DebugLogSet = true
 	runCalled := false
 
-	if err := runApplication(
+	if err := runApplicationWithKubectlLookup(
 		values,
 		changedFlags(t, values.Model, values.DebugLog),
 		func(engine tui.Engine) error {
@@ -79,6 +81,7 @@ func TestRunApplicationLogsLifecycle(t *testing.T) {
 			}
 			return nil
 		},
+		func(string) (string, error) { return "kubectl", nil },
 	); err != nil {
 		t.Fatalf("runApplication() error = %v", err)
 	}
@@ -94,6 +97,27 @@ func TestRunApplicationLogsLifecycle(t *testing.T) {
 	}
 }
 
+func TestRunApplicationRejectsMissingKubectl(t *testing.T) {
+	values := testConfigValues()
+	runCalled := false
+
+	err := runApplicationWithKubectlLookup(
+		values,
+		changedFlags(t, values.Model, values.DebugLog),
+		func(tui.Engine) error {
+			runCalled = true
+			return nil
+		},
+		func(string) (string, error) { return "", exec.ErrNotFound },
+	)
+	if err == nil || !strings.Contains(err.Error(), "kubectl was not found in PATH") {
+		t.Errorf("runApplicationWithKubectlLookup() error = %v, want missing kubectl error", err)
+	}
+	if runCalled {
+		t.Error("TUI runner was called after kubectl lookup failed")
+	}
+}
+
 func testConfigValues() config.Values {
 	return config.Values{Model: "qwen3", ModelSet: true, OllamaURL: config.DefaultOllamaURL, OllamaTimeout: config.DefaultOllamaTimeout, KubectlTimeout: config.DefaultKubectlTimeout, MaxToolOutputBytes: config.DefaultMaxToolOutputBytes, MaxHistoryChars: config.DefaultMaxHistoryChars, MaxIterations: config.DefaultMaxIterations}
 }
@@ -106,6 +130,9 @@ func changedFlags(t *testing.T, model, debugLog string) *pflag.FlagSet {
 	flags.String("debug-log", "", "")
 	if err := flags.Set("model", model); err != nil {
 		t.Fatalf("Set model flag error = %v", err)
+	}
+	if debugLog == "" {
+		return flags
 	}
 	if err := flags.Set("debug-log", debugLog); err != nil {
 		t.Fatalf("Set debug log flag error = %v", err)

@@ -1,8 +1,10 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"time"
 
 	"github.com/spf13/pflag"
@@ -15,6 +17,15 @@ import (
 )
 
 func runApplication(values config.Values, flags *pflag.FlagSet, runTUI tuiRunner) (returnErr error) {
+	return runApplicationWithKubectlLookup(values, flags, runTUI, exec.LookPath)
+}
+
+func runApplicationWithKubectlLookup(
+	values config.Values,
+	flags *pflag.FlagSet,
+	runTUI tuiRunner,
+	lookupKubectl func(string) (string, error),
+) (returnErr error) {
 	values = valuesFromFlags(values, flags)
 
 	loadedConfig, err := config.Load(values, os.LookupEnv, time.Now())
@@ -33,6 +44,14 @@ func runApplication(values config.Values, flags *pflag.FlagSet, runTUI tuiRunner
 			returnErr = fmt.Errorf("close diagnostics: %w", err)
 		}
 	}()
+	kubectlPath, err := lookupKubectl("kubectl")
+	if err != nil {
+		if errors.Is(err, exec.ErrNotFound) {
+			return errors.New("kubectl was not found in PATH")
+		}
+		return fmt.Errorf("find kubectl: %w", err)
+	}
+	logger.Info("kubectl found", "event", "kubectl_found", "path", kubectlPath)
 
 	model, err := ollama.New(loadedConfig.OllamaURL, loadedConfig.Model, loadedConfig.OllamaTimeout, logger)
 	if err != nil {

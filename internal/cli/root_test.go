@@ -5,6 +5,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/spf13/pflag"
+
+	"k8s-watson/internal/config"
 	"k8s-watson/internal/tui"
 )
 
@@ -27,7 +30,20 @@ func TestExecuteExitCodes(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
-			if got := execute(test.args, &stdout, &stderr, func(tui.Engine) error { return nil }); got != test.want {
+			if got := executeWithApplicationRunner(
+				test.args,
+				&stdout,
+				&stderr,
+				func(tui.Engine) error { return nil },
+				func(values config.Values, flags *pflag.FlagSet, runner tuiRunner) error {
+					return runApplicationWithKubectlLookup(
+						values,
+						flags,
+						runner,
+						func(string) (string, error) { return "kubectl", nil },
+					)
+				},
+			); got != test.want {
 				t.Errorf("Execute(%v) = %d, want %d; stderr = %q", test.args, got, test.want, stderr.String())
 			}
 			if test.wantStderr != "" && stderr.String() != test.wantStderr {

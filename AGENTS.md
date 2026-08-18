@@ -30,3 +30,7 @@ After each logically complete block of changes:
 
 1. Format changed Go files with `gofmt -w`.
 2. Run `make verify`.
+
+# Tests
+
+All tests must be unit tests. They must not depend on the local environment or call external services, including Kubernetes clusters, Ollama, network endpoints, or locally installed executables.
