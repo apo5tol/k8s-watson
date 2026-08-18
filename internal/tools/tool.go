@@ -12,5 +12,8 @@ type Tool interface {
 }
 
 type PreparedCall interface {
+	Display() string
+	RequiresApproval() bool
+	Metadata() map[string]string
 	Execute(context.Context) (agent.ToolResult, error)
 }

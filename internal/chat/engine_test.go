@@ -38,6 +38,18 @@ type fakePreparedCall struct {
 	execute func(context.Context) (agent.ToolResult, error)
 }
 
+func (fakePreparedCall) Display() string {
+	return "fake"
+}
+
+func (fakePreparedCall) RequiresApproval() bool {
+	return false
+}
+
+func (fakePreparedCall) Metadata() map[string]string {
+	return map[string]string{}
+}
+
 func (c fakePreparedCall) Execute(ctx context.Context) (agent.ToolResult, error) {
 	return c.execute(ctx)
 }
